@@ -28,7 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 _addon.name = 'GEO-HUD'
 _addon.author = 'Nalfey'
-_addon.version = '1.3.0'
+_addon.version = '1.4.0'
 _addon.commands = {'geohud', 'gh'}
 
 require('tables')
@@ -71,6 +71,7 @@ local defaults = {
     cure_enmity = true,
     ipc = true,
     always_show = false,
+    show_hud = true,
     max_list = 8,
     show_mobs = false,
     scan_yalms = 35,
@@ -1022,7 +1023,7 @@ local function show_hp_bar()
 end
 
 local function update_hp_bar(alive, pct)
-    if hidden or not alive then
+    if hidden or settings.show_hud == false or not alive then
         hide_hp_bar()
         return
     end
@@ -1174,7 +1175,7 @@ local function orb_slot()
 end
 
 local function update_orb(alive)
-    if hidden or not alive or settings.orbs == false then
+    if hidden or settings.show_hud == false or not alive or settings.orbs == false then
         hide_orb()
         return
     end
@@ -1237,7 +1238,7 @@ local function update_orb(alive)
 end
 
 local function update_indi_orb(active)
-    if hidden or not active or settings.orbs == false then
+    if hidden or settings.show_hud == false or not active or settings.orbs == false then
         hide_indi_orb()
         return
     end
@@ -1287,7 +1288,7 @@ local function update_indi_orb(active)
 end
 
 local function update_entrust_orbs()
-    if hidden or #entrusted == 0 or settings.orbs == false then
+    if hidden or settings.show_hud == false or #entrusted == 0 or settings.orbs == false then
         hide_entrust_orbs()
         return
     end
@@ -1349,7 +1350,7 @@ local function update_entrust_orbs()
 end
 
 local function update_hud(luopan, geo_id, we_are_geo)
-    if hidden then
+    if hidden or settings.show_hud == false then
         hud:hide()
         hide_orb()
         hide_indi_orb()
@@ -1775,6 +1776,7 @@ end
 local function print_help()
     chat('Commands:')
     chat('  //geohud show | hide | reset')
+    chat('  //geohud hud on|off       — hide text/orbs, keep ground rings')
     chat('  //geohud radius <yalms>   — bubble radius (default 6; Widened Compass auto-doubles)')
     chat('  //geohud ipc on|off       — share tags/Indi/Entrust with other local Windower instances')
     chat('  //geohud orbs on|off      — luopan / Indi / Entrust bubble animations')
@@ -2005,6 +2007,7 @@ windower.register_event('addon command', function(command, ...)
     elseif command == 'show' then
         hidden = false
         settings.always_show = true
+        settings.show_hud = true
         config.save(settings)
         chat('HUD shown.')
     elseif command == 'hide' then
@@ -2016,7 +2019,25 @@ windower.register_event('addon command', function(command, ...)
         hide_hp_bar()
         hide_hud_panel()
         write_tagged_rings()
-        chat('HUD hidden. //geohud show to restore.')
+        chat('HUD and rings hidden. //geohud show to restore.')
+    elseif command == 'hud' then
+        local arg = args[1] and args[1]:lower()
+        if arg == 'on' then settings.show_hud = true
+        elseif arg == 'off' then settings.show_hud = false
+        else settings.show_hud = not (settings.show_hud ~= false) end
+        if settings.show_hud then
+            hidden = false
+        end
+        config.save(settings)
+        if settings.show_hud == false then
+            hud:hide()
+            hide_orb()
+            hide_indi_orb()
+            hide_entrust_orbs()
+            hide_hp_bar()
+            hide_hud_panel()
+        end
+        chat('HUD ' .. (settings.show_hud ~= false and 'on' or 'off') .. (settings.show_hud == false and ' (rings still tracking)' or '') .. '.')
     elseif command == 'reset' then
         clear_tags()
         chat('Cleared enmity tags.')
