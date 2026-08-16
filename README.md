@@ -2,11 +2,11 @@
 
 Windower 4 addon for Geomancer luopan / Indi / Entrust tracking and ground rings for enmity/tagging.
 
-![GEO-HUD 01](https://ibb.co/wr798GYt)
+![GEO-HUD 01](https://i.ibb.co/PzM7JXtk/GEO-HUD-01.jpg)
 
-![GEO-HUD 02](https://ibb.co/twJTQWKV)
+![GEO-HUD 02](https://i.ibb.co/7x1dj6Cs/GEO-HUD-02.jpg)
 
-![GEO-HUD 03](https://ibb.co/wmCqyVW)
+![GEO-HUD 03](https://i.ibb.co/V4DGVRS/GEO-HUD-03.jpg)
 
 
 ## Install
