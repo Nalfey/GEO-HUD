@@ -1,6 +1,6 @@
 # GEO-HUD
 
-Windower 4 addon for Geomancer luopan / Indi / Entrust tracking and ground rings for enmity/tagging.
+Windower 4 addon for Geomancer Luopan / Indi / Entrust tracking and ground rings for enmity/tagging.
 
 ![GEO-HUD 01](https://i.ibb.co/PzM7JXtk/GEO-HUD-01.jpg)
 
