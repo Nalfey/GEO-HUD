@@ -28,3 +28,7 @@ Then in game:
 ```
 
 Ground rings need a native Windower plugin. Windower can only load those from `plugins/`, so GEO-HUD copies `plugin/BCRings.dll` there the first time you load the addon, then runs `load BCRings`. Unloading GEO-HUD unloads the plugin too.
+
+## Special Thanks
+
+Special thanks to Broguypal for sharing his [TargetRing](https://github.com/Broguypal/Addons/tree/main/TargetRing) code.
