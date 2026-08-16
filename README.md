@@ -32,3 +32,12 @@ Ground rings need a native Windower plugin. Windower can only load those from `p
 ## Special Thanks
 
 Special thanks to Broguypal for sharing his [TargetRing](https://github.com/Broguypal/Addons/tree/main/TargetRing) code.
+
+### v1.5.0
+* Fix for the ground rings after Windower LuaCore 2.6.8.4 update.
+
+### v1.4.0
+* Added commands for HUD customisation.
+
+### v1.2.0
+* First release.
