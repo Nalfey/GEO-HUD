@@ -1,0 +1,4 @@
+LIBRARY "BubbleRings"
+EXPORTS
+    GetInterfaceVersion
+    CreateInstance
