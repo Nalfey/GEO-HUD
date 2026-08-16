@@ -28,7 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 _addon.name = 'GEO-HUD'
 _addon.author = 'Nalfey'
-_addon.version = '1.2.0'
+_addon.version = '1.3.0'
 _addon.commands = {'geohud', 'gh'}
 
 require('tables')
@@ -75,6 +75,7 @@ local defaults = {
     show_mobs = false,
     scan_yalms = 35,
     rings = true,
+    orbs = true,
     orb_size = 72,
     orb_pad = 8,
     camera = {
@@ -1173,7 +1174,7 @@ local function orb_slot()
 end
 
 local function update_orb(alive)
-    if hidden or not alive then
+    if hidden or not alive or settings.orbs == false then
         hide_orb()
         return
     end
@@ -1236,7 +1237,7 @@ local function update_orb(alive)
 end
 
 local function update_indi_orb(active)
-    if hidden or not active then
+    if hidden or not active or settings.orbs == false then
         hide_indi_orb()
         return
     end
@@ -1286,7 +1287,7 @@ local function update_indi_orb(active)
 end
 
 local function update_entrust_orbs()
-    if hidden or #entrusted == 0 then
+    if hidden or #entrusted == 0 or settings.orbs == false then
         hide_entrust_orbs()
         return
     end
@@ -1776,6 +1777,7 @@ local function print_help()
     chat('  //geohud show | hide | reset')
     chat('  //geohud radius <yalms>   — bubble radius (default 6; Widened Compass auto-doubles)')
     chat('  //geohud ipc on|off       — share tags/Indi/Entrust with other local Windower instances')
+    chat('  //geohud orbs on|off      — luopan / Indi / Entrust bubble animations')
     chat('  //geohud rings on|off     — green = GEO has tagged and mob is in bubble, red = not yet')
     chat('  //geohud mobs on|off      — nearby mob list under the HUD (off by default)')
     chat('  Drag the HUD to reposition. + tagged (potency on), ! in bubble with no GEO hate.')
@@ -2018,6 +2020,18 @@ windower.register_event('addon command', function(command, ...)
     elseif command == 'reset' then
         clear_tags()
         chat('Cleared enmity tags.')
+    elseif command == 'orbs' or command == 'orb' then
+        local arg = args[1] and args[1]:lower()
+        if arg == 'on' then settings.orbs = true
+        elseif arg == 'off' then settings.orbs = false
+        else settings.orbs = not settings.orbs end
+        config.save(settings)
+        if settings.orbs == false then
+            hide_orb()
+            hide_indi_orb()
+            hide_entrust_orbs()
+        end
+        chat('Bubble animations ' .. (settings.orbs ~= false and 'on' or 'off') .. '.')
     elseif command == 'radius' then
         local n = tonumber(args[1])
         if not n or n < 1 or n > 30 then
