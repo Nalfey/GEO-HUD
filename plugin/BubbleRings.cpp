@@ -86,10 +86,24 @@ public:
         close_state_change_notification();
     }
 
-    void __stdcall PostRender() override {
-        projection_matrices_valid_ = false;
+    // Hook 4.7.9.3+ appears to clear or invalidate view/proj by PostRender for
+    // third-party plugins. Capture while the scene matrices are still live.
+    // Do not draw in PreRender — that is before models finish posing, so JSON
+    // positions skate ahead of moving entities.
+    void __stdcall PreRender() override {
+        prerender_matrices_valid_ = false;
+        if (!d3d_device_) {
+            probe_device("prerender");
+        }
+        if (d3d_device_ && capture_projection_matrices_from_device()) {
+            prerender_matrices_valid_ = true;
+        }
+        note_hook_pulse("PreRender");
+    }
 
-        draw_ring_overlay();
+    void __stdcall PostRender() override {
+        note_hook_pulse("PostRender");
+        draw_ring_overlay("PostRender");
     }
 
 private:
@@ -133,8 +147,12 @@ private:
         bool is_npc = false;
         float model_size = 0.0f;
         float model_scale = 1.0f;
+        float radius = 0.0f;
+        bool has_radius = false;
         bool valid = false;
         bool active = false;
+        bool has_pos = false;
+        Position pos {};
     };
 
     static constexpr int ring_slices_ = 48;
@@ -158,7 +176,24 @@ private:
 
     }
 
-    void draw_ring_overlay() {
+    void note_draw_skip(const char* stage, const char* reason) {
+        const DWORD now = GetTickCount();
+        if (last_draw_skip_reason_[0] != '\0'
+            && std::strcmp(last_draw_skip_reason_, reason) == 0
+            && now - last_draw_skip_log_ms_ < 5000u) {
+            return;
+        }
+
+        last_draw_skip_log_ms_ = now;
+        std::snprintf(last_draw_skip_reason_, sizeof(last_draw_skip_reason_), "%s", reason);
+
+        char message[192] {};
+        std::snprintf(message, sizeof(message), "draw skip stage=%s reason=%s tagged=%d device=%p",
+            stage ? stage : "?", reason, tagged_count_, static_cast<void*>(d3d_device_));
+        append_log(message);
+    }
+
+    void draw_ring_overlay(const char* stage) {
         read_state();
 
         if (tagged_count_ <= 0) {
@@ -170,61 +205,109 @@ private:
         }
 
         if (!d3d_device_) {
+            note_draw_skip(stage, "no_device");
             return;
         }
 
+        IDirect3DSurface8* old_rt = nullptr;
+        IDirect3DSurface8* old_ds = nullptr;
+        IDirect3DSurface8* back = nullptr;
+        const bool rebound = bind_back_buffer(old_rt, old_ds, back);
+
         D3DVIEWPORT8 viewport {};
         if (FAILED(d3d_device_->GetViewport(&viewport)) || viewport.Width == 0 || viewport.Height == 0) {
+            note_draw_skip(stage, "viewport");
+            restore_render_target(old_rt, old_ds, back, rebound);
             return;
         }
 
         if (!refresh_projection_matrices()) {
+            note_draw_skip(stage, "matrices");
+            restore_render_target(old_rt, old_ds, back, rebound);
             return;
         }
 
-        std::uintptr_t mob_array = 0;
-        if (!Locator::entity_table(mob_array)) {
-            return;
+        if (tagged_count_ > 0 && tagged_[0].valid && tagged_[0].has_pos) {
+            Locator::discover_context_if_needed(tagged_[0].index, tagged_[0].pos);
+        } else if (player_has_pos_ && player_index_ != 0) {
+            Locator::discover_context_if_needed(player_index_, player_pos_);
         }
+
+        std::uintptr_t mob_array = 0;
+        const bool have_table = Locator::entity_table(mob_array);
 
         const float phase = static_cast<float>(GetTickCount() % kPulsePeriodMs)
             / static_cast<float>(kPulsePeriodMs);
         const float pulse = 0.72f + 0.28f * std::sin(phase * 6.28318530718f);
 
         if (!begin_draw_state()) {
+            note_draw_skip(stage, "begin_draw");
+            restore_render_target(old_rt, old_ds, back, rebound);
             return;
         }
 
         batch_vertex_count_ = 0;
-        refresh_player_occluder(mob_array, viewport);
+        if (have_table) {
+            refresh_player_occluder(mob_array, viewport);
+        } else {
+            refresh_player_occluder_from_json(viewport);
+        }
 
         for (int i = 0; i < tagged_count_; ++i) {
             if (tagged_[i].valid) {
                 const DWORD color = tagged_[i].active ? kActiveColour : kInactiveColour;
-                draw_entity_ring(mob_array, tagged_[i], viewport, color, pulse);
+                draw_entity_ring(mob_array, have_table, tagged_[i], viewport, color, pulse);
             }
         }
 
-        flush_batch();
+        const int queued = batch_vertex_count_;
+        const HRESULT draw_hr = flush_batch_hr();
         end_draw_state();
+        restore_render_target(old_rt, old_ds, back, rebound);
+
+        const DWORD now = GetTickCount();
+        if (now - last_draw_ok_log_ms_ >= 5000u) {
+            last_draw_ok_log_ms_ = now;
+            char message[192] {};
+            std::snprintf(message, sizeof(message),
+                "draw ok stage=%s tagged=%d verts=%d hr=0x%08lX vp=%lux%lu back=%d",
+                stage ? stage : "?", tagged_count_, queued,
+                static_cast<unsigned long>(draw_hr),
+                static_cast<unsigned long>(viewport.Width),
+                static_cast<unsigned long>(viewport.Height),
+                rebound ? 1 : 0);
+            append_log(message);
+        }
     }
 
-    void draw_entity_ring(std::uintptr_t mob_array, const Entity& entity,
+    void draw_entity_ring(std::uintptr_t mob_array, bool have_table, const Entity& entity,
         const D3DVIEWPORT8& viewport, DWORD color, float pulse) {
-        std::uintptr_t actor = 0;
         Position root {};
-        if (!Locator::actor_for(mob_array, entity.index, actor)
-            || !Locator::ground_position(actor, root)) {
+        bool have_root = false;
+
+        // Prefer live actor roots so rings stick to the posed model. Lua JSON
+        // coords can lead while entities are interpolating between updates.
+        if (have_table) {
+            std::uintptr_t actor = 0;
+            if (Locator::actor_for(mob_array, entity.index, actor)
+                && Locator::ground_position(actor, root)) {
+                have_root = true;
+            }
+        }
+        if (!have_root && entity.has_pos) {
+            root = entity.pos;
+            have_root = true;
+        }
+        if (!have_root) {
             return;
         }
 
-        const float radius = entity_radius(entity);
+        const float radius = entity.has_radius ? entity.radius : entity_radius(entity);
 
         draw_ground_ring(root, radius * 1.18f, radius * 0.34f,
             viewport, scale_alpha(color, 0.30f * pulse * kOpacity));
         draw_ground_ring(root, radius, radius * 0.12f,
             viewport, scale_alpha(color, 0.95f * pulse * kOpacity));
-
     }
 
     void draw_ground_ring(const Position& centre, float radius,
@@ -346,6 +429,38 @@ private:
         player_occluder_valid_ = true;
     }
 
+    void refresh_player_occluder_from_json(const D3DVIEWPORT8& viewport) {
+        player_occluder_valid_ = false;
+        if (!player_has_pos_) {
+            return;
+        }
+
+        const Position& root = player_pos_;
+        const Position feet {root.east, root.north, root.height + 0.12f};
+        const Position head {root.east, root.north, root.height - kPlayerBodyHeight};
+        const Position side {root.east + kPlayerOccludeRadius, root.north, root.height};
+
+        float side_x = 0.0f;
+        float side_y = 0.0f;
+        float side_rhw = 1.0f;
+        float feet_rhw = 1.0f;
+        float head_rhw = 1.0f;
+        if (!world_to_screen(feet, viewport, player_foot_x_, player_foot_y_, feet_rhw)
+            || !world_to_screen(head, viewport, player_head_x_, player_head_y_, head_rhw)
+            || feet_rhw <= 0.0f || head_rhw <= 0.0f) {
+            return;
+        }
+
+        if (world_to_screen(side, viewport, side_x, side_y, side_rhw) && side_rhw > 0.0f) {
+            player_half_width_ = std::hypot(side_x - player_foot_x_, side_y - player_foot_y_);
+        } else {
+            player_half_width_ = 18.0f;
+        }
+
+        player_half_width_ = std::fmax(10.0f, std::fmin(player_half_width_, 90.0f));
+        player_occluder_valid_ = true;
+    }
+
     float player_cover(float screen_x, float screen_y) const {
         if (!player_occluder_valid_) {
             return 0.0f;
@@ -386,6 +501,7 @@ private:
 
     float entity_radius(const Entity& entity) const {
         static constexpr float humanoid = 1.15f;
+        static constexpr float default_size = 1.0f;
 
         float footprint = kPlayerFootprint;
 
@@ -393,9 +509,12 @@ private:
         // it is compressed above the humanoid baseline and then halved. Players
         // report values that map far too tight, and their footprint barely
         // varies by race, so they take a flat figure instead.
+        // LuaCore 2.6.8.4+ often zeros model_size; use a unit size so model_scale
+        // still changes the ring per mob.
         if (entity.is_npc) {
             const float scale = entity.model_scale > 0.0f ? entity.model_scale : 1.0f;
-            float extent = entity.model_size > 0.0f ? entity.model_size * scale : humanoid;
+            const float size = entity.model_size > 0.0f ? entity.model_size : default_size;
+            float extent = size * scale;
 
             if (extent > humanoid) {
                 extent = humanoid + std::sqrt(extent - humanoid) * 0.62f;
@@ -435,16 +554,27 @@ private:
         append_log(message);
     }
 
-    bool refresh_projection_matrices() {
+    bool capture_projection_matrices_from_device() {
         if (!d3d_device_) {
             return false;
         }
 
-        if (FAILED(d3d_device_->GetTransform(D3DTS_VIEW, &cached_view_)) ||
-            FAILED(d3d_device_->GetTransform(D3DTS_PROJECTION, &cached_projection_))) {
-            projection_matrices_valid_ = false;
+        D3DMATRIX view {};
+        D3DMATRIX projection {};
+        if (FAILED(d3d_device_->GetTransform(D3DTS_VIEW, &view)) ||
+            FAILED(d3d_device_->GetTransform(D3DTS_PROJECTION, &projection))) {
             return false;
         }
+
+        // Reject obviously-cleared matrices (Hook PostRender regression).
+        const float view_trace = view.m[0][0] + view.m[1][1] + view.m[2][2];
+        const float proj_m11 = projection.m[1][1];
+        if (std::fabs(view_trace) < 0.0001f || std::fabs(proj_m11) < 0.0001f) {
+            return false;
+        }
+
+        cached_view_ = view;
+        cached_projection_ = projection;
 
         for (int row = 0; row < 4; ++row) {
             for (int column = 0; column < 4; ++column) {
@@ -458,6 +588,37 @@ private:
 
         projection_matrices_valid_ = true;
         return true;
+    }
+
+    bool refresh_projection_matrices() {
+        if (capture_projection_matrices_from_device()) {
+            return true;
+        }
+
+        // Fall back to matrices captured in PreRender this frame.
+        if (prerender_matrices_valid_ && projection_matrices_valid_) {
+            return true;
+        }
+
+        projection_matrices_valid_ = false;
+        return false;
+    }
+
+    void note_hook_pulse(const char* stage) {
+        const DWORD now = GetTickCount();
+        if (now - last_hook_pulse_ms_ < 5000u) {
+            return;
+        }
+        last_hook_pulse_ms_ = now;
+
+        char message[160] {};
+        std::snprintf(message, sizeof(message),
+            "hook pulse stage=%s device=%p matrices=%d prerender_cache=%d",
+            stage,
+            static_cast<void*>(d3d_device_),
+            projection_matrices_valid_ ? 1 : 0,
+            prerender_matrices_valid_ ? 1 : 0);
+        append_log(message);
     }
 
     // FFXI Lua positions use x/y as the ground plane and z as height; D3D wants
@@ -526,8 +687,10 @@ private:
         d3d_device_->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
         d3d_device_->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
         d3d_device_->SetRenderState(D3DRS_ZENABLE, FALSE);
+        d3d_device_->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
         d3d_device_->SetRenderState(D3DRS_LIGHTING, FALSE);
         d3d_device_->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        d3d_device_->SetRenderState(D3DRS_FOGENABLE, FALSE);
         d3d_device_->SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
 
         draw_state_active_ = true;
@@ -577,6 +740,76 @@ private:
         d3d_device_->DrawPrimitiveUP(D3DPT_TRIANGLELIST,
             static_cast<UINT>(batch_vertex_count_ / 3), batch_vertices_, sizeof(DrawVertex));
         batch_vertex_count_ = 0;
+    }
+
+    HRESULT flush_batch_hr() {
+        if (batch_vertex_count_ < 3 || !d3d_device_) {
+            batch_vertex_count_ = 0;
+            return S_FALSE;
+        }
+
+        const HRESULT hr = d3d_device_->DrawPrimitiveUP(D3DPT_TRIANGLELIST,
+            static_cast<UINT>(batch_vertex_count_ / 3), batch_vertices_, sizeof(DrawVertex));
+        batch_vertex_count_ = 0;
+        return hr;
+    }
+
+    bool bind_back_buffer(IDirect3DSurface8*& old_rt, IDirect3DSurface8*& old_ds,
+        IDirect3DSurface8*& back) {
+        old_rt = nullptr;
+        old_ds = nullptr;
+        back = nullptr;
+        if (!d3d_device_) {
+            return false;
+        }
+
+        if (FAILED(d3d_device_->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &back)) || !back) {
+            return false;
+        }
+
+        d3d_device_->GetRenderTarget(&old_rt);
+        d3d_device_->GetDepthStencilSurface(&old_ds);
+        if (old_rt == back) {
+            return true;
+        }
+
+        if (FAILED(d3d_device_->SetRenderTarget(back, old_ds))) {
+            return false;
+        }
+        return true;
+    }
+
+    void restore_render_target(IDirect3DSurface8* old_rt, IDirect3DSurface8* old_ds,
+        IDirect3DSurface8* back, bool rebound) {
+        if (!d3d_device_) {
+            return;
+        }
+
+        if (rebound && old_rt && old_rt != back) {
+            d3d_device_->SetRenderTarget(old_rt, old_ds);
+        }
+
+        if (old_rt) {
+            old_rt->Release();
+        }
+        if (old_ds) {
+            old_ds->Release();
+        }
+        if (back) {
+            back->Release();
+        }
+    }
+
+    void draw_screen_marker(const D3DVIEWPORT8& viewport) {
+        const float x0 = static_cast<float>(viewport.X) + 20.0f;
+        const float y0 = static_cast<float>(viewport.Y) + 20.0f;
+        const DWORD color = 0xFFFF00FF;
+        DrawVertex tri[3] = {
+            {x0, y0, 0.0f, 1.0f, color},
+            {x0 + 80.0f, y0, 0.0f, 1.0f, color},
+            {x0, y0 + 80.0f, 0.0f, 1.0f, color},
+        };
+        append_batch(tri, 3);
     }
 
     struct Locator {
@@ -635,16 +868,21 @@ private:
             return std::isfinite(value) && std::fabs(value) <= limit;
         }
 
-        static bool entity_table(std::uintptr_t& table) {
+        static std::uintptr_t& context_offset() {
+            static std::uintptr_t offset = kContextSlot;
+            return offset;
+        }
+
+        static bool& discovery_finished() {
+            static bool done = false;
+            return done;
+        }
+
+        static bool entity_table_at(std::uintptr_t core_base, std::uintptr_t offset,
+            std::uintptr_t& table) {
             table = 0;
-
-            HMODULE core = GetModuleHandleA("LuaCore.dll");
-            if (!core) {
-                return false;
-            }
-
             std::uintptr_t context = 0;
-            if (!fetch(reinterpret_cast<std::uintptr_t>(core) + kContextSlot, context)) {
+            if (!fetch(core_base + offset, context) || context == 0) {
                 return false;
             }
 
@@ -654,6 +892,73 @@ private:
             }
 
             return true;
+        }
+
+        static bool validate_context(std::uintptr_t core_base, std::uintptr_t offset,
+            DWORD index, const Position& hint) {
+            std::uintptr_t table = 0;
+            if (!entity_table_at(core_base, offset, table)) {
+                return false;
+            }
+
+            std::uintptr_t actor = 0;
+            Position root {};
+            if (!actor_for(table, index, actor) || !ground_position(actor, root)) {
+                return false;
+            }
+
+            const float dx = root.east - hint.east;
+            const float dy = root.north - hint.north;
+            const float dz = root.height - hint.height;
+            return (dx * dx + dy * dy + dz * dz) < 64.0f;
+        }
+
+        static void discover_context_if_needed(DWORD index, const Position& hint) {
+            if (discovery_finished() || index == 0) {
+                return;
+            }
+
+            HMODULE core = GetModuleHandleA("LuaCore.dll");
+            if (!core) {
+                discovery_finished() = true;
+                return;
+            }
+
+            const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(core);
+            if (validate_context(base, context_offset(), index, hint)) {
+                discovery_finished() = true;
+                return;
+            }
+
+            for (std::intptr_t delta = 4; delta <= 0x30000; delta += 4) {
+                const std::uintptr_t up = kContextSlot + static_cast<std::uintptr_t>(delta);
+                const std::uintptr_t down = kContextSlot - static_cast<std::uintptr_t>(delta);
+                if (validate_context(base, up, index, hint)) {
+                    context_offset() = up;
+                    discovery_finished() = true;
+                    return;
+                }
+                if (delta < static_cast<std::intptr_t>(kContextSlot)
+                    && validate_context(base, down, index, hint)) {
+                    context_offset() = down;
+                    discovery_finished() = true;
+                    return;
+                }
+            }
+
+            discovery_finished() = true;
+        }
+
+        static bool entity_table(std::uintptr_t& table) {
+            table = 0;
+
+            HMODULE core = GetModuleHandleA("LuaCore.dll");
+            if (!core) {
+                return false;
+            }
+
+            return entity_table_at(reinterpret_cast<std::uintptr_t>(core),
+                context_offset(), table);
         }
 
         static bool actor_for(std::uintptr_t table, DWORD index, std::uintptr_t& actor) {
@@ -748,6 +1053,8 @@ private:
 
     void parse_player_index(const char* buffer) {
         player_index_ = 0;
+        player_has_pos_ = false;
+        player_pos_ = {};
         const char* key_pos = std::strstr(buffer, "\"player\"");
         if (!key_pos) {
             return;
@@ -759,7 +1066,7 @@ private:
             return;
         }
 
-        char object_text[128] {};
+        char object_text[192] {};
         const char* object_end = std::strchr(object, '}');
         if (!object_end) {
             return;
@@ -772,6 +1079,17 @@ private:
         player_index_ = parse_json_uint(object_text, "\"index\"");
         if (player_index_ >= kMaxIndex) {
             player_index_ = 0;
+        }
+
+        // Windower Lua: x/y ground plane, z height.
+        if (std::strstr(object_text, "\"x\"") && std::strstr(object_text, "\"y\"")
+            && std::strstr(object_text, "\"z\"")) {
+            player_pos_.east = parse_json_float(object_text, "\"x\"");
+            player_pos_.north = parse_json_float(object_text, "\"y\"");
+            player_pos_.height = parse_json_float(object_text, "\"z\"");
+            player_has_pos_ = Locator::plausible(player_pos_.east, kWorldLimit)
+                && Locator::plausible(player_pos_.north, kWorldLimit)
+                && Locator::plausible(player_pos_.height, kWorldLimit);
         }
     }
 
@@ -817,8 +1135,19 @@ private:
             entity.is_npc = parse_json_bool(object, "\"npc\"");
             entity.model_size = parse_json_float(object, "\"model_size\"");
             entity.model_scale = parse_json_float(object, "\"model_scale\"");
+            entity.radius = parse_json_float(object, "\"radius\"");
+            entity.has_radius = entity.radius > 0.05f;
             entity.active = parse_json_bool(object, "\"green\"");
             entity.valid = entity.index != 0 && entity.index < 0x900;
+            if (std::strstr(object, "\"x\"") && std::strstr(object, "\"y\"")
+                && std::strstr(object, "\"z\"")) {
+                entity.pos.east = parse_json_float(object, "\"x\"");
+                entity.pos.north = parse_json_float(object, "\"y\"");
+                entity.pos.height = parse_json_float(object, "\"z\"");
+                entity.has_pos = Locator::plausible(entity.pos.east, kWorldLimit)
+                    && Locator::plausible(entity.pos.north, kWorldLimit)
+                    && Locator::plausible(entity.pos.height, kWorldLimit);
+            }
             if (entity.valid) {
                 tagged_[tagged_count_++] = entity;
             }
@@ -942,6 +1271,9 @@ private:
 
     char state_path_[1024] {};
     char log_path_[1024] {};
+    char last_draw_skip_reason_[64] {};
+    DWORD last_draw_skip_log_ms_ = 0;
+    DWORD last_draw_ok_log_ms_ = 0;
     HANDLE state_change_notification_ = INVALID_HANDLE_VALUE;
 
     IDirect3DDevice8* d3d_device_ = nullptr;
@@ -949,6 +1281,8 @@ private:
     D3DMATRIX cached_projection_ {};
     D3DMATRIX cached_view_projection_ {};
     bool projection_matrices_valid_ = false;
+    bool prerender_matrices_valid_ = false;
+    DWORD last_hook_pulse_ms_ = 0;
 
     DWORD saved_shader_ = 0;
     DWORD saved_alpha_ = 0;
@@ -966,6 +1300,8 @@ private:
     Entity tagged_[kMaxTagged] {};
     int tagged_count_ = 0;
     DWORD player_index_ = 0;
+    bool player_has_pos_ = false;
+    Position player_pos_ {};
     bool player_occluder_valid_ = false;
     float player_foot_x_ = 0.0f;
     float player_foot_y_ = 0.0f;

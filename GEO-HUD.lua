@@ -28,7 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 _addon.name = 'GEO-HUD'
 _addon.author = 'Nalfey'
-_addon.version = '1.4.0'
+_addon.version = '1.5.0'
 _addon.commands = {'geohud', 'gh'}
 
 require('tables')
@@ -154,6 +154,7 @@ local last_luopan_id = nil
 local bubble_hpp = 0
 local bubble_alive = false
 local hidden = false
+local ring_test_until = 0
 local debug_on = false
 local last_hud = ''
 local last_scan = 0
@@ -172,6 +173,8 @@ local ring_plugin_dest = windower.windower_path .. 'plugins/BCRings.dll'
 local last_ring_payload = ''
 local checked_plugin = false
 local check_plugin_at = 0
+local ring_plugin_retry_at = 0
+local ring_plugin_pending_data = nil
 local MAX_RINGS = 50
 
 -- FFXI element ids → asset folders (matches in-game Geo- spell orbs).
@@ -1643,23 +1646,80 @@ local function reset_zone()
     hide_hud_panel()
 end
 
+local function estimate_ring_radius(mob)
+    local humanoid = 1.15
+    local player_foot = 0.64
+    if not mob then
+        return player_foot
+    end
+    if not mob.is_npc then
+        return player_foot
+    end
+
+    local size = tonumber(mob.model_size) or 0
+    local scale = tonumber(mob.model_scale) or 1
+    if scale <= 0 then
+        scale = 1
+    end
+
+    local extent
+    if size > 0.05 then
+        extent = size * scale
+        if extent > humanoid then
+            extent = humanoid + math.sqrt(extent - humanoid) * 0.62
+        end
+    else
+        -- LuaCore often zeros model_size; invert scale around 0.5 so large
+        -- models (small scale) get larger rings instead of tiny ones.
+        extent = humanoid * (0.5 / math.max(scale, 0.18))
+        if extent > 3.0 then
+            extent = 3.0 + math.sqrt(extent - 3.0) * 0.5
+        end
+    end
+
+    local footprint = extent * 0.5
+    if footprint < 0.45 then
+        footprint = 0.45
+    elseif footprint > 8 then
+        footprint = 8
+    end
+    return footprint
+end
+
 local function describe_ring(mob, green)
     if not mob then
         return nil
     end
-    return ('{"index":%u,"npc":%s,"model_size":%.3f,"model_scale":%.3f,"green":%s}'):format(
+    return ('{"index":%u,"npc":%s,"model_size":%.3f,"model_scale":%.3f,"radius":%.3f,"green":%s,"x":%.3f,"y":%.3f,"z":%.3f}'):format(
         mob.index or 0,
         mob.is_npc and 'true' or 'false',
         tonumber(mob.model_size) or 0,
         tonumber(mob.model_scale) or 1,
-        green and 'true' or 'false')
+        estimate_ring_radius(mob),
+        green and 'true' or 'false',
+        tonumber(mob.x) or 0,
+        tonumber(mob.y) or 0,
+        tonumber(mob.z) or 0)
 end
 
 local function write_tagged_rings(luopan)
     local payload
     if hidden or not settings.rings then
         payload = '{"player":null,"tagged":[]}\n'
+    elseif ring_test_until > 0 and os.clock() < ring_test_until then
+        local me = windower.ffxi.get_mob_by_target('me')
+        if me and me.index and me.index ~= 0 then
+            local desc = ('{"index":%u,"npc":false,"model_size":1.150,"model_scale":1.000,"radius":0.640,"green":true,"x":%.3f,"y":%.3f,"z":%.3f}'):format(
+                me.index, tonumber(me.x) or 0, tonumber(me.y) or 0, tonumber(me.z) or 0)
+            payload = ('{"player":{"index":%u,"x":%.3f,"y":%.3f,"z":%.3f},"tagged":[%s]}\n'):format(
+                me.index, tonumber(me.x) or 0, tonumber(me.y) or 0, tonumber(me.z) or 0, desc)
+        else
+            payload = '{"player":null,"tagged":[]}\n'
+        end
     else
+        if ring_test_until > 0 and os.clock() >= ring_test_until then
+            ring_test_until = 0
+        end
         if luopan == nil then
             luopan = select(1, resolve_bubble())
         end
@@ -1696,7 +1756,8 @@ local function write_tagged_rings(luopan)
         local me = windower.ffxi.get_mob_by_target('me')
         local player_json = 'null'
         if me and me.index and me.index ~= 0 then
-            player_json = ('{"index":%u}'):format(me.index)
+            player_json = ('{"index":%u,"x":%.3f,"y":%.3f,"z":%.3f}'):format(
+                me.index, tonumber(me.x) or 0, tonumber(me.y) or 0, tonumber(me.z) or 0)
         end
         payload = ('{"player":%s,"tagged":[%s]}\n'):format(player_json, table.concat(parts, ','))
     end
@@ -1721,41 +1782,78 @@ local function plugin_log_exists()
     return true
 end
 
-local function file_size(path)
+local function read_file_bytes(path)
     local handle = io.open(path, 'rb')
     if not handle then return nil end
-    local size = handle:seek('end')
+    local data = handle:read('*a')
     handle:close()
-    return size
+    return data
 end
 
-local function copy_bundled_ring_plugin()
-    local src = io.open(ring_plugin_bundled, 'rb')
-    if not src then
-        return false
-    end
-    local data = src:read('*a')
-    src:close()
+-- Returns: ok, updated (true if dest was rewritten), locked (true if update needed but file busy)
+local function install_bundled_ring_plugin(data)
     if not data or #data == 0 then
-        return false
+        return false, false, false
     end
     windower.create_dir(windower.windower_path .. 'plugins')
-    local dest_size = file_size(ring_plugin_dest)
-    if dest_size == #data then
-        return true
+    local dest = read_file_bytes(ring_plugin_dest)
+    if dest == data then
+        return true, false, false
     end
     local dst = io.open(ring_plugin_dest, 'wb')
     if not dst then
-        return dest_size ~= nil
+        return false, false, true
     end
     dst:write(data)
     dst:close()
-    return true
+    local verify = read_file_bytes(ring_plugin_dest)
+    return verify == data, true, false
 end
 
 local function ensure_ring_plugin()
-    copy_bundled_ring_plugin()
+    local data = read_file_bytes(ring_plugin_bundled)
+    if not data or #data == 0 then
+        chat('Missing bundled plugin/BCRings.dll — rings cannot start.')
+        return
+    end
+
+    local ok, updated, locked = install_bundled_ring_plugin(data)
+    if locked then
+        -- Old DLL is loaded; unload so we can replace it, then retry shortly.
+        ring_plugin_pending_data = data
+        ring_plugin_retry_at = os.clock() + 1.25
+        windower.send_command('unload ' .. ring_plugin_name)
+        chat('Updating BCRings.dll to the version shipped with GEO-HUD...')
+        return
+    end
+
+    ring_plugin_pending_data = nil
+    ring_plugin_retry_at = 0
+    if updated then
+        chat('Installed current BCRings.dll from the addon folder.')
+    end
     windower.send_command('wait 1; load ' .. ring_plugin_name)
+end
+
+local function finish_pending_ring_plugin_update()
+    if ring_plugin_retry_at <= 0 or os.clock() < ring_plugin_retry_at then
+        return
+    end
+    local data = ring_plugin_pending_data
+    ring_plugin_retry_at = 0
+    ring_plugin_pending_data = nil
+    if not data then
+        return
+    end
+    local ok, updated, locked = install_bundled_ring_plugin(data)
+    if locked or not ok then
+        chat('Could not replace BCRings.dll (still locked). Close Windower once, then //lua load GEO-HUD.')
+        return
+    end
+    if updated then
+        chat('Installed current BCRings.dll from the addon folder.')
+    end
+    windower.send_command('wait 0.5; load ' .. ring_plugin_name)
 end
 
 local function release_ring_plugin()
@@ -1982,6 +2080,7 @@ windower.register_event('prerender', function()
     update_hp_bar(luopan ~= nil, luopan and luopan.hpp or 0)
     update_hud_panel()
     local now = os.clock()
+    finish_pending_ring_plugin_update()
     if not checked_plugin and check_plugin_at > 0 and os.clock() >= check_plugin_at then
         checked_plugin = true
         report_rings()
@@ -2064,6 +2163,16 @@ windower.register_event('addon command', function(command, ...)
         chat('Bubble radius set to ' .. n .. ' yalms.')
     elseif command == 'rings' or command == 'ring' then
         local arg = args[1] and args[1]:lower()
+        if arg == 'test' or arg == 'self' then
+            settings.rings = true
+            hidden = false
+            ensure_ring_plugin()
+            ring_test_until = os.clock() + 30
+            last_ring_payload = ''
+            write_tagged_rings()
+            chat('Ring test: green ring under you for 30s.')
+            return
+        end
         if arg == 'on' then settings.rings = true
         elseif arg == 'off' then settings.rings = false
         else settings.rings = not settings.rings end
