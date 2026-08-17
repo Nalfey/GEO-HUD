@@ -1,0 +1,9 @@
+LIBRARY "_GEORings25.dll"
+EXPORTS
+    luaopen_geohud_rings
+    luaopen_geohud_rings2
+    luaopen__GEORings
+    luaopen__GEORings23
+    luaopen__GEORings24
+    luaopen__GEORings25
+    luaopen__GEORings_new

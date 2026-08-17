@@ -1,0 +1,4 @@
+plugin/build/
+plugin/BubbleRings.dll
+data/
+*.log
