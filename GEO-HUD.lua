@@ -28,7 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 _addon.name = 'GEO-HUD'
 _addon.author = 'Nalfey'
-_addon.version = '1.9.0'
+_addon.version = '1.9.1'
 _addon.commands = {'geohud', 'gh'}
 
 require('tables')
@@ -262,6 +262,10 @@ function profile.apply()
     if job then
         profile.apply_snap(settings, profile.read(profile.path(char, job)))
     end
+    local player = windower.ffxi.get_player()
+    if not player or (player.main_job_id ~= C.geo_job and player.main_job ~= 'GEO') then
+        settings.cardinal_chant = false
+    end
 end
 
 function profile.save()
@@ -370,7 +374,34 @@ local chant = {
     west = 0xE6FFE03C,
     radius = 1.15,
     names = { 'Magic Crit', 'Magic Attack', 'Magic Accuracy', 'Magic Burst' },
+    town_ids = S{
+        26, 50, 53, 70, 80, 87, 94,
+        230, 231, 232, 233, 234, 235, 236, 237,
+        238, 239, 240, 241, 242, 243, 244, 245, 246,
+        247, 248, 249, 250, 252, 256, 257,
+        280, 281, 283, 284, 285,
+    },
 }
+
+function chant.main_geo()
+    local player = windower.ffxi.get_player()
+    return player and (player.main_job_id == C.geo_job or player.main_job == 'GEO')
+end
+
+function chant.in_town()
+    local info = windower.ffxi.get_info()
+    if not info then
+        return true
+    end
+    if info.mog_house then
+        return true
+    end
+    return chant.town_ids[tonumber(info.zone) or 0] == true
+end
+
+function chant.enabled()
+    return settings.cardinal_chant and chant.main_geo() and not chant.in_town()
+end
 
 local addon_dir = windower.addon_path:gsub('\\', '/'):gsub('/+$', '') .. '/'
 package.cpath = addon_dir .. 'libs/?.dll;' .. package.cpath
@@ -1716,7 +1747,7 @@ local function update_hud(luopan, geo_id, we_are_geo)
     end
 
     local player = windower.ffxi.get_player()
-    local show = settings.always_show or we_are_geo or is_geo_job(player) or luopan or last_spell or last_indi or last_geo_id or #entrusted > 0 or settings.cardinal_chant
+    local show = settings.always_show or we_are_geo or is_geo_job(player) or luopan or last_spell or last_indi or last_geo_id or #entrusted > 0 or chant.enabled()
     if not show then
         hud:hide()
         hide_orb()
@@ -2021,6 +2052,9 @@ local function reset_zone()
     hide_entrust_orbs()
     hide_hp_bar()
     hide_hud_panel()
+    if rings_available() and _GEORings.chant then
+        _GEORings.chant(0, 0, 0, 0, 0, 0)
+    end
 end
 
 local function estimate_ring_radius(mob)
@@ -2159,7 +2193,7 @@ function chant.offset(me, tgt)
 end
 
 function chant.hud_line()
-    if not settings.cardinal_chant then
+    if not chant.enabled() then
         return nil
     end
     local me = windower.ffxi.get_mob_by_target('me')
@@ -2198,7 +2232,7 @@ function chant.submit()
     if not rings_available() or not _GEORings.chant then
         return
     end
-    if hidden or not settings.cardinal_chant then
+    if hidden or not chant.enabled() then
         _GEORings.chant(0, 0, 0, 0, 0, 0)
         return
     end
@@ -2237,7 +2271,7 @@ function profile.apply_visuals()
         hide_hp_bar()
         hide_hud_panel()
     end
-    if not hidden and (settings.rings or settings.cardinal_chant) then
+    if not hidden and (settings.rings or chant.enabled()) then
         start_rings()
         if not settings.rings and rings_available() then
             _GEORings.clear()
@@ -2247,6 +2281,9 @@ function profile.apply_visuals()
         end
     else
         stop_rings()
+    end
+    if rings_available() and _GEORings.chant and not chant.enabled() then
+        _GEORings.chant(0, 0, 0, 0, 0, 0)
     end
 end
 
@@ -2461,7 +2498,7 @@ local function print_help()
     chat('  //geohud ipc on|off       — share tags/Indi/Entrust with other local Windower instances')
     chat('  //geohud orbs on|off      — luopan / Indi / Entrust bubble animations')
     chat('  //geohud rings on|off     — debuff: green = tagged in bubble; buff: green = party in bubble')
-    chat('  //geohud cardinalchant on|off — circle under you: N blue crit, E red MAB, S green macc, W yellow MB')
+    chat('  //geohud cardinalchant on|off — main GEO only, off in towns: N blue crit, E red MAB, S green macc, W yellow MB')
     chat('  //geohud colorblind on|off — X on red rings, O on green rings')
     chat('  //geohud rings status     — native ring module hook/device state')
     chat('  //geohud mobs on|off      — nearby mob list under the HUD (off by default)')
@@ -2918,11 +2955,18 @@ windower.register_event('addon command', function(command, ...)
         chat('Ground rings ' .. (settings.rings and 'on' or 'off') .. '.')
     elseif command == 'cardinalchant' or command == 'cardinal' or command == 'chant' or command == 'cc' then
         local arg = args[1] and args[1]:lower()
+        if arg ~= 'off' and not chant.main_geo() then
+            settings.cardinal_chant = false
+            profile.save()
+            chant.submit()
+            chat('Cardinal Chant is only available on main GEO.')
+            return
+        end
         if arg == 'on' then settings.cardinal_chant = true
         elseif arg == 'off' then settings.cardinal_chant = false
         else settings.cardinal_chant = not settings.cardinal_chant end
         profile.save()
-        if settings.rings or settings.cardinal_chant then
+        if settings.rings or chant.enabled() then
             start_rings()
             chant.submit()
         else

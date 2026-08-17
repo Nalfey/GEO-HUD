@@ -37,7 +37,8 @@ Special thanks to Broguypal for sharing his [TargetRing](https://github.com/Brog
 
 
 
-### v1.9.0
+<<<<<<< HEAD
+### v1.9.1
 * Cardinal Chant circle: `//geohud cardinalchant on` draws a ring under you that follows the target's direction. North = blue magic crit, east = red magic attack, south = green magic accuracy, west = yellow magic burst. In-between bearings blend the two nearest colours.
 
 * Per-character and per-job settings files so HUD, orbs, rings, and the mob list can differ by character and job.
