@@ -15,7 +15,7 @@ Copy the **GEO-HUD** folder into `Windower4/addons/` so you have:
 
 ```
 Windower4/addons/GEO-HUD/GEO-HUD.lua
-Windower4/addons/GEO-HUD/libs/_GEORings34.dll
+Windower4/addons/GEO-HUD/libs/_GEORings35.dll
 Windower4/addons/GEO-HUD/assets/...
 ```
 
@@ -25,7 +25,7 @@ Then in game:
 //lua load GEO-HUD
 ```
 
-Ground rings are drawn by `libs/_GEORings34.dll`, loaded from the addon folder. Nothing goes in `Windower4/plugins/`.
+Ground rings are drawn by `libs/_GEORings35.dll`, loaded from the addon folder. Nothing goes in `Windower4/plugins/`.
 
 If you previously used GEO-HUD 1.4, this version unloads `BCRings` and deletes `Windower4/plugins/BCRings.dll` on load so the old plugin cannot double-draw. You can also remove `load BCRings` from `init.txt` if it is still there.
 
@@ -36,6 +36,9 @@ GEO-HUD and TargetRing can run together. GEO-HUD finds `draw_scene` even after T
 Special thanks to Broguypal for sharing his [TargetRing](https://github.com/Broguypal/Addons/tree/main/TargetRing) code.
 
 
+
+### v1.9.5
+* Do not free the draw_scene trampoline if another addon chained on top of GEO-HUD, so unloading GEO-HUD after TargetRing no longer crashes.
 
 ### v1.9.4
 * Accept D3D devices from wrappers such as dgVoodoo: if GetDevice returns an object outside d3d8.dll, keep it when Release/EndScene/GetViewport/DrawPrimitiveUP look like real code. Renderer scan skips unreadable slots and looks 0x8000 bytes instead of 0x2000.

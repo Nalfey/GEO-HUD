@@ -1831,6 +1831,7 @@ bool remove_hook() {
     unlock_rings();
     g_hooked = false;
 
+    bool restored = false;
     if (our_hook_installed()) {
         unsigned char const* restore = kDrawScenePrologue;
         if (code_callable(reinterpret_cast<void const*>(g_previous_hook))) {
@@ -1846,6 +1847,7 @@ bool remove_hook() {
         std::memcpy(reinterpret_cast<void*>(g_draw_scene), restore, kPrologueBytes);
         VirtualProtect(reinterpret_cast<void*>(g_draw_scene), kPrologueBytes, previous, &previous);
         FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(g_draw_scene), kPrologueBytes);
+        restored = true;
     }
 
     g_previous_hook = nullptr;
@@ -1854,9 +1856,12 @@ bool remove_hook() {
     g_device_attempts = 0;
     Sleep(60);
 
-    if (g_trampoline_mem) {
+    // Only safe once our jump is gone. If another addon chained on top of us our
+    // hook stays live, and draw_scene_hook still falls back to g_trampoline.
+    if (restored && g_trampoline_mem) {
         VirtualFree(g_trampoline_mem, 0, MEM_RELEASE);
         g_trampoline_mem = nullptr;
+        g_trampoline = nullptr;
     }
 
     std::snprintf(g_status, sizeof(g_status), "unhooked");
@@ -1878,7 +1883,7 @@ int __cdecl lua_stop(lua_State* L) {
 int __cdecl lua_status(lua_State* L) {
     char report[320] {};
     std::snprintf(report, sizeof(report),
-        "n34 hooked=%s frames=%lu draws=%lu device=%08lX rings=%d | %s",
+        "n35 hooked=%s frames=%lu draws=%lu device=%08lX rings=%d | %s",
         g_hooked ? "yes" : "no", g_frames, g_draws,
         static_cast<unsigned long>(g_device), g_ring_count, g_status);
     g_lua.pushstring(L, report);
@@ -2034,7 +2039,7 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings(lua_State* L) {
 
     g_lua.createtable(L, 0, 11);
 
-    g_lua.pushstring(L, "1.9.4");
+    g_lua.pushstring(L, "1.9.5");
     g_lua.setfield(L, -2, "native");
 
     g_lua.pushcclosure(L, lua_start, 0);
@@ -2125,6 +2130,10 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings33(lua_State* L) {
 }
 
 extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings34(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings35(lua_State* L) {
     return luaopen__GEORings(L);
 }
 

@@ -28,7 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 _addon.name = 'GEO-HUD'
 _addon.author = 'Nalfey'
-_addon.version = '1.9.4'
+_addon.version = '1.9.5'
 _addon.commands = {'geohud', 'gh'}
 
 require('tables')
@@ -424,9 +424,9 @@ local function open_ring_dll(filename, init)
 end
 
 local rings_loaded_from = nil
-local rings_ok, rings_load_error = open_ring_dll('_GEORings34.dll', 'luaopen__GEORings34')
+local rings_ok, rings_load_error = open_ring_dll('_GEORings35.dll', 'luaopen__GEORings35')
 if rings_ok then
-    rings_loaded_from = '_GEORings34.dll'
+    rings_loaded_from = '_GEORings35.dll'
 end
 
 local function rings_available()
@@ -2468,7 +2468,7 @@ local function report_rings()
     else
         chat('Ground rings: native module failed to load.')
         chat(tostring(rings_load_error))
-        chat('Expected addons/GEO-HUD/libs/_GEORings34.dll.')
+        chat('Expected addons/GEO-HUD/libs/_GEORings35.dll.')
     end
     chat('Rings drawing ' .. (settings.rings and 'on' or 'off') .. '  (//geohud rings on|off)')
 end
