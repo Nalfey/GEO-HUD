@@ -19,6 +19,7 @@ using fn_pushvalue = void(__cdecl*)(lua_State*, int);
 using fn_pushstring = void(__cdecl*)(lua_State*, char const*);
 using fn_gettop = int(__cdecl*)(lua_State*);
 using fn_tonumber = double(__cdecl*)(lua_State*, int);
+using fn_pushnumber = void(__cdecl*)(lua_State*, double);
 
 constexpr int kGlobalsIndex = -10002;
 
@@ -30,10 +31,11 @@ struct LuaApi {
     fn_pushstring pushstring = nullptr;
     fn_gettop gettop = nullptr;
     fn_tonumber tonumber = nullptr;
+    fn_pushnumber pushnumber = nullptr;
 
     bool ready() const {
         return createtable && pushcclosure && setfield && pushvalue
-            && pushstring && gettop && tonumber;
+            && pushstring && gettop && tonumber && pushnumber;
     }
 };
 
@@ -117,6 +119,15 @@ int g_active_slices = ring_slices_max_;
 bool g_draw_outer_glow = true;
 bool g_colorblind = false;
 Ring g_chant {};
+
+struct CompassMark {
+    float x = -1.0f;
+    float y = -1.0f;
+    float z = 0.0f;
+    float rhw = 1.0f;
+    bool ok = false;
+};
+CompassMark g_compass[4] {}; // N, E, S, W screen positions from last draw
 
 using draw_scene_fn = void(__fastcall*)(void*, void*);
 draw_scene_fn g_trampoline = nullptr;
@@ -665,6 +676,19 @@ bool emit_quad(const Position& a, const Position& b, const Position& c, const Po
     return true;
 }
 
+void emit_screen_quad(float x0, float y0, float x1, float y1,
+    float z, float rhw, DWORD color) {
+    DrawVertex quad[6] = {
+        {x0, y0, z, rhw, color},
+        {x1, y0, z, rhw, color},
+        {x0, y1, z, rhw, color},
+        {x0, y1, z, rhw, color},
+        {x1, y0, z, rhw, color},
+        {x1, y1, z, rhw, color},
+    };
+    append_batch(quad, 6);
+}
+
 void emit_bar(const Position& origin, float dir_east, float dir_north,
     float half_len, float half_w, const D3DVIEWPORT8& viewport, DWORD color) {
     const float len = std::hypot(dir_east, dir_north);
@@ -927,6 +951,157 @@ void unlock_rings() {
     }
 }
 
+struct ArialGlyph {
+    int w = 0;
+    int h = 0;
+    unsigned char pixels[96 * 96] {};
+};
+
+ArialGlyph g_arial_glyphs[4] {};
+bool g_arial_ready = false;
+
+// Bake Arial Bold N/E/S/W once via GDI, then tint the coverage with the ring colour.
+bool rasterize_arial_bold() {
+    if (g_arial_ready) {
+        return true;
+    }
+
+    HDC hdc = CreateCompatibleDC(nullptr);
+    if (!hdc) {
+        return false;
+    }
+
+    HFONT font = CreateFontW(-56, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+        ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Arial");
+    if (!font) {
+        DeleteDC(hdc);
+        return false;
+    }
+
+    HGDIOBJ previous = SelectObject(hdc, font);
+    MAT2 mat {};
+    mat.eM11.value = 1;
+    mat.eM22.value = 1;
+    wchar_t const chars[4] = { L'N', L'E', L'S', L'W' };
+    unsigned char buffer[96 * 96];
+    int baked = 0;
+
+    for (int i = 0; i < 4; ++i) {
+        GLYPHMETRICS gm {};
+        DWORD needed = GetGlyphOutlineW(hdc, chars[i], GGO_GRAY8_BITMAP, &gm, 0, nullptr, &mat);
+        if (needed == GDI_ERROR || needed == 0 || needed > sizeof(buffer)) {
+            continue;
+        }
+        if (GetGlyphOutlineW(hdc, chars[i], GGO_GRAY8_BITMAP, &gm, needed, buffer, &mat) == GDI_ERROR) {
+            continue;
+        }
+
+        int const w = static_cast<int>(gm.gmBlackBoxX);
+        int const h = static_cast<int>(gm.gmBlackBoxY);
+        if (w <= 0 || h <= 0) {
+            continue;
+        }
+        int const stride = static_cast<int>(needed / static_cast<DWORD>(h));
+        ArialGlyph& glyph = g_arial_glyphs[i];
+        glyph.w = w < 96 ? w : 96;
+        glyph.h = h < 96 ? h : 96;
+        std::memset(glyph.pixels, 0, sizeof(glyph.pixels));
+        for (int y = 0; y < glyph.h; ++y) {
+            int copy = glyph.w;
+            if (copy > stride) {
+                copy = stride;
+            }
+            std::memcpy(glyph.pixels + y * 96, buffer + y * stride, static_cast<std::size_t>(copy));
+        }
+        ++baked;
+    }
+
+    SelectObject(hdc, previous);
+    DeleteObject(font);
+    DeleteDC(hdc);
+    g_arial_ready = baked == 4;
+    return g_arial_ready;
+}
+
+// Arial Bold N/E/S/W laid flat on the ground with the chant ring. Each letter
+// sits on the outer glow; the top of the glyph points outward so they read as
+// compass marks. Tinted with the live ring colour at 80% opacity.
+void draw_chant_compass(const Position& centre, float radius,
+    const D3DVIEWPORT8& viewport, DWORD color) {
+    if ((color & 0xFF000000u) == 0 || !rasterize_arial_bold()) {
+        return;
+    }
+
+    const float dist = radius * 1.18f;
+    const float h = centre.height - kGroundClearance + 0.02f;
+    const Position points[4] = {
+        {centre.east, centre.north + dist, h},
+        {centre.east + dist, centre.north, h},
+        {centre.east, centre.north - dist, h},
+        {centre.east - dist, centre.north, h},
+    };
+    // Outward / right in (east, north) for N, E, S, W.
+    const float out_e[4] = { 0.0f,  1.0f,  0.0f, -1.0f };
+    const float out_n[4] = { 1.0f,  0.0f, -1.0f,  0.0f };
+    const float right_e[4] = { 1.0f,  0.0f, -1.0f,  0.0f };
+    const float right_n[4] = { 0.0f, -1.0f,  0.0f,  1.0f };
+
+    const DWORD fill = scale_alpha(color, 0.80f);
+
+    for (int i = 0; i < 4; ++i) {
+        CompassMark mark {};
+        mark.ok = world_to_screen(points[i], viewport, mark.x, mark.y, mark.rhw, mark.z)
+            && mark.rhw > 0.0f;
+        if (!mark.ok) {
+            mark.x = -1.0f;
+            mark.y = -1.0f;
+            g_compass[i] = mark;
+            continue;
+        }
+        g_compass[i] = mark;
+
+        ArialGlyph const& glyph = g_arial_glyphs[i];
+        if (glyph.w <= 0 || glyph.h <= 0) {
+            continue;
+        }
+
+        const float world_h = dist * 0.195f;
+        const float cell = world_h / static_cast<float>(glyph.h);
+        const float half_w = static_cast<float>(glyph.w) * cell * 0.5f;
+        const float half_h = static_cast<float>(glyph.h) * cell * 0.5f;
+        const Position origin = points[i];
+
+        for (int r = 0; r < glyph.h; ++r) {
+            for (int c = 0; c < glyph.w; ++c) {
+                const unsigned char cov = glyph.pixels[r * 96 + c];
+                if (cov < 8) {
+                    continue;
+                }
+                const DWORD pix = scale_alpha(fill, static_cast<float>(cov) / 64.0f);
+                const float u0 = -half_w + static_cast<float>(c) * cell;
+                const float u1 = u0 + cell;
+                const float v0 = half_h - static_cast<float>(r) * cell;
+                const float v1 = v0 - cell;
+
+                const Position a {
+                    origin.east + right_e[i] * u0 + out_e[i] * v0,
+                    origin.north + right_n[i] * u0 + out_n[i] * v0, h};
+                const Position b {
+                    origin.east + right_e[i] * u1 + out_e[i] * v0,
+                    origin.north + right_n[i] * u1 + out_n[i] * v0, h};
+                const Position cpos {
+                    origin.east + right_e[i] * u1 + out_e[i] * v1,
+                    origin.north + right_n[i] * u1 + out_n[i] * v1, h};
+                const Position d {
+                    origin.east + right_e[i] * u0 + out_e[i] * v1,
+                    origin.north + right_n[i] * u0 + out_n[i] * v1, h};
+                emit_quad(a, b, cpos, d, viewport, pix);
+            }
+        }
+    }
+}
+
 void draw_all_rings() {
     if (!d3d_device_) {
         return;
@@ -949,6 +1124,7 @@ void draw_all_rings() {
     unlock_rings();
 
     if (count <= 0 && !chant.active) {
+        g_compass[0].ok = g_compass[1].ok = g_compass[2].ok = g_compass[3].ok = false;
         return;
     }
 
@@ -1028,6 +1204,11 @@ void draw_all_rings() {
         }
         draw_ground_ring(centre, chant.radius, chant.radius * 0.12f,
             viewport, scale_alpha(chant.color, 0.95f * pulse));
+
+        draw_chant_compass(centre, chant.radius, viewport,
+            scale_alpha(chant.color, 0.95f * pulse));
+    } else {
+        g_compass[0].ok = g_compass[1].ok = g_compass[2].ok = g_compass[3].ok = false;
     }
 
     flush_batch();
@@ -1080,6 +1261,11 @@ bool try_accept_d3d_resource(std::uintptr_t resource, std::uintptr_t d3d_base, s
 
     std::uintptr_t const address = reinterpret_cast<std::uintptr_t>(device);
     if (!span_readable(address, sizeof(std::uintptr_t))) {
+        // get_device AddRef'd the object; release before bailing
+        auto release = reinterpret_cast<fn_release>(vtable_slot(address, 2));
+        if (release) {
+            release(device);
+        }
         return false;
     }
 
@@ -1625,6 +1811,12 @@ bool remove_hook() {
     g_last_seen_frames = 0;
     g_inner_ok_ms = 0;
     Sleep(60);
+
+    if (g_trampoline_mem) {
+        VirtualFree(g_trampoline_mem, 0, MEM_RELEASE);
+        g_trampoline_mem = nullptr;
+    }
+
     std::snprintf(g_status, sizeof(g_status), "unhooked");
     return true;
 }
@@ -1644,7 +1836,7 @@ int __cdecl lua_stop(lua_State* L) {
 int __cdecl lua_status(lua_State* L) {
     char report[320] {};
     std::snprintf(report, sizeof(report),
-        "n25 hooked=%s frames=%lu draws=%lu device=%08lX rings=%d | %s",
+        "n33 hooked=%s frames=%lu draws=%lu device=%08lX rings=%d | %s",
         g_hooked ? "yes" : "no", g_frames, g_draws,
         static_cast<unsigned long>(g_device), g_ring_count, g_status);
     g_lua.pushstring(L, report);
@@ -1712,6 +1904,22 @@ int __cdecl lua_chant(lua_State* L) {
     return 0;
 }
 
+int __cdecl lua_compass(lua_State* L) {
+    if (!g_lua.pushnumber) {
+        return 0;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (g_compass[i].ok) {
+            g_lua.pushnumber(L, g_compass[i].x);
+            g_lua.pushnumber(L, g_compass[i].y);
+        } else {
+            g_lua.pushnumber(L, -1.0);
+            g_lua.pushnumber(L, -1.0);
+        }
+    }
+    return 8;
+}
+
 int __cdecl lua_add(lua_State* L) {
     if (g_lua.gettop(L) < 6) {
         return 0;
@@ -1762,6 +1970,8 @@ bool bind_lua() {
             reinterpret_cast<void*>(GetProcAddress(module, "lua_gettop")));
         g_lua.tonumber = reinterpret_cast<fn_tonumber>(
             reinterpret_cast<void*>(GetProcAddress(module, "lua_tonumber")));
+        g_lua.pushnumber = reinterpret_cast<fn_pushnumber>(
+            reinterpret_cast<void*>(GetProcAddress(module, "lua_pushnumber")));
 
         if (g_lua.ready()) {
             return true;
@@ -1780,9 +1990,9 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings(lua_State* L) {
 
     build_tables();
 
-    g_lua.createtable(L, 0, 10);
+    g_lua.createtable(L, 0, 11);
 
-    g_lua.pushstring(L, "1.9.0");
+    g_lua.pushstring(L, "1.9.9");
     g_lua.setfield(L, -2, "native");
 
     g_lua.pushcclosure(L, lua_start, 0);
@@ -1812,6 +2022,9 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings(lua_State* L) {
     g_lua.pushcclosure(L, lua_chant, 0);
     g_lua.setfield(L, -2, "chant");
 
+    g_lua.pushcclosure(L, lua_compass, 0);
+    g_lua.setfield(L, -2, "compass");
+
     g_lua.pushvalue(L, -1);
     g_lua.setfield(L, kGlobalsIndex, "_GEORings");
     return 1;
@@ -1834,6 +2047,38 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings24(lua_State* L) {
 }
 
 extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings25(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings26(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings27(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings28(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings29(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings30(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings31(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings32(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings33(lua_State* L) {
     return luaopen__GEORings(L);
 }
 

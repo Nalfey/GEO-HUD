@@ -15,7 +15,7 @@ Copy the **GEO-HUD** folder into `Windower4/addons/` so you have:
 
 ```
 Windower4/addons/GEO-HUD/GEO-HUD.lua
-Windower4/addons/GEO-HUD/libs/_GEORings25.dll
+Windower4/addons/GEO-HUD/libs/_GEORings33.dll
 Windower4/addons/GEO-HUD/assets/...
 ```
 
@@ -25,7 +25,7 @@ Then in game:
 //lua load GEO-HUD
 ```
 
-Ground rings are drawn by `libs/_GEORings25.dll`, loaded from the addon folder. Nothing goes in `Windower4/plugins/`.
+Ground rings are drawn by `libs/_GEORings33.dll`, loaded from the addon folder. Nothing goes in `Windower4/plugins/`.
 
 If you previously used GEO-HUD 1.4, this version unloads `BCRings` and deletes `Windower4/plugins/BCRings.dll` on load so the old plugin cannot double-draw. You can also remove `load BCRings` from `init.txt` if it is still there.
 
@@ -37,8 +37,15 @@ Special thanks to Broguypal for sharing his [TargetRing](https://github.com/Brog
 
 
 
-<<<<<<< HEAD
+### v1.9.3
+* Cardinal Chant ring shows N/S/E/W letters at the world compass points.
+
+* Performance: ring list and Cardinal Chant updates throttled to 10 Hz in `prerender`; trampoline page freed on DLL unload; D3D device COM ref released on scan failure.
+
 ### v1.9.1
+* Cardinal Chant is main GEO only, off by default on other jobs, and the circle hides in towns.
+
+### v1.9.0
 * Cardinal Chant circle: `//geohud cardinalchant on` draws a ring under you that follows the target's direction. North = blue magic crit, east = red magic attack, south = green magic accuracy, west = yellow magic burst. In-between bearings blend the two nearest colours.
 
 * Per-character and per-job settings files so HUD, orbs, rings, and the mob list can differ by character and job.

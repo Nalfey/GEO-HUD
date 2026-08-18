@@ -12,6 +12,7 @@ add_library(_GEORings SHARED
 
 set_target_properties(_GEORings PROPERTIES
     PREFIX ""
+    OUTPUT_NAME "_GEORings33"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../libs"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../libs"
 )
@@ -23,4 +24,5 @@ if(MSVC)
 else()
     target_compile_options(_GEORings PRIVATE -Wall -Wextra -Wpedantic -m32)
     target_link_options(_GEORings PRIVATE -m32 -static -static-libgcc -static-libstdc++)
+    target_link_libraries(_GEORings PRIVATE gdi32)
 endif()

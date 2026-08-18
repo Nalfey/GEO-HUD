@@ -28,7 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 _addon.name = 'GEO-HUD'
 _addon.author = 'Nalfey'
-_addon.version = '1.9.1'
+_addon.version = '1.9.3'
 _addon.commands = {'geohud', 'gh'}
 
 require('tables')
@@ -357,6 +357,7 @@ local ring_test_until = 0
 local debug_on = false
 local last_hud = ''
 local last_scan = 0
+local last_rings_submit = 0  -- throttle: ring list pushed at most 10 Hz
 local last_ipc = 0
 local last_ipc_payload = ''
 local nearby_ids = {}      -- scanned enemy ids (positions are re-read each frame)
@@ -422,28 +423,10 @@ local function open_ring_dll(filename, init)
     return true, filename
 end
 
-local function require_ring_dll(module_name)
-    local ok, err = pcall(require, module_name)
-    if not ok then
-        return false, tostring(err)
-    end
-    if _GEORings == nil or _GEORings.native == nil then
-        return false, 'require ' .. module_name .. ' loaded an old native module'
-    end
-    return true, 'require ' .. module_name
-end
-
 local rings_loaded_from = nil
-local rings_ok, rings_load_error = open_ring_dll('_GEORings25.dll', 'luaopen__GEORings25')
+local rings_ok, rings_load_error = open_ring_dll('_GEORings33.dll', 'luaopen__GEORings33')
 if rings_ok then
-    rings_loaded_from = '_GEORings25.dll'
-else
-    local retry_ok, retry_from = require_ring_dll('_GEORings25')
-    if retry_ok then
-        rings_ok = true
-        rings_loaded_from = retry_from
-        rings_load_error = nil
-    end
+    rings_loaded_from = '_GEORings33.dll'
 end
 
 local function rings_available()
@@ -2485,7 +2468,7 @@ local function report_rings()
     else
         chat('Ground rings: native module failed to load.')
         chat(tostring(rings_load_error))
-        chat('Expected addons/GEO-HUD/libs/_GEORings25.dll.')
+        chat('Expected addons/GEO-HUD/libs/_GEORings33.dll.')
     end
     chat('Rings drawing ' .. (settings.rings and 'on' or 'off') .. '  (//geohud rings on|off)')
 end
@@ -2759,7 +2742,7 @@ windower.register_event('prerender', function()
         hide_entrust_orbs()
         hide_hp_bar()
         hide_hud_panel()
-        submit_rings()
+        submit_rings()   -- clears rings; not throttled so they disappear immediately
         chant.submit()
         return
     end
@@ -2774,7 +2757,7 @@ windower.register_event('prerender', function()
         hide_entrust_orbs()
         hide_hp_bar()
         hide_hud_panel()
-        submit_rings()
+        submit_rings()   -- clears rings; not throttled so they disappear immediately
         chant.submit()
         return
     end
@@ -2798,11 +2781,15 @@ windower.register_event('prerender', function()
         send_ipc(luopan, geo_id)
     end
 
-    -- Lua sends the ring list; the native module reads live posed coords.
-    if settings.rings and not hidden then
-        submit_rings(luopan)
+    -- Lua sends the ring list at 10 Hz; the native DLL reads live entity
+    -- positions every frame so circles stay smooth between updates.
+    if now - last_rings_submit >= 0.1 then
+        last_rings_submit = now
+        if settings.rings and not hidden then
+            submit_rings(luopan)
+        end
+        chant.submit()
     end
-    chant.submit()
 end)
 
 windower.register_event('addon command', function(command, ...)
