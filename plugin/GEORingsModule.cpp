@@ -143,7 +143,11 @@ DWORD g_inner_ok_ms = 0;
 std::uintptr_t g_renderer = 0;
 std::uintptr_t g_device = 0;
 volatile bool g_discovery_done = false;
-unsigned long g_device_try_frame = 0;
+unsigned long g_device_attempts = 0;
+constexpr std::size_t kRendererScanWindow = 0x8000;
+constexpr std::size_t kDeviceVtableEntries = 90;
+constexpr unsigned long kDeviceRetryFrames = 30;
+constexpr unsigned long kMaxDeviceAttempts = 240;
 using fn_end_scene = long(__stdcall*)(void*);
 constexpr int kEndSceneSlot = 35;
 fn_end_scene g_orig_end_scene = nullptr;
@@ -1238,6 +1242,36 @@ bool looks_like_d3d_vtable(std::uintptr_t vtable, std::uintptr_t d3d_base, std::
     return true;
 }
 
+// A wrapper chain can leave the resources in d3d8.dll while the device object
+// itself lives in another module, so same-module is treated as confirmation
+// rather than a requirement. Anything else has to look structurally like a
+// device: the four slots we actually call must resolve to real code.
+bool plausible_device_vtable(std::uintptr_t vtable) {
+    if (!span_readable(vtable, sizeof(std::uintptr_t) * kDeviceVtableEntries)) {
+        return false;
+    }
+
+    static int const probes[] = { 2, 35, 41, 72 };
+    for (int slot : probes) {
+        std::uintptr_t entry = 0;
+        std::memcpy(&entry,
+            reinterpret_cast<void const*>(vtable + static_cast<std::uintptr_t>(slot) * sizeof(std::uintptr_t)),
+            sizeof(entry));
+        if (entry == 0) {
+            return false;
+        }
+
+        MEMORY_BASIC_INFORMATION region {};
+        if (!VirtualQuery(reinterpret_cast<void const*>(entry), &region, sizeof(region))
+            || region.State != MEM_COMMIT
+            || !page_executable(region.Protect)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool try_accept_d3d_resource(std::uintptr_t resource, std::uintptr_t d3d_base, std::size_t d3d_size) {
     if (resource == 0 || !span_readable(resource, sizeof(std::uintptr_t))) {
         return false;
@@ -1271,7 +1305,10 @@ bool try_accept_d3d_resource(std::uintptr_t resource, std::uintptr_t d3d_base, s
 
     std::uintptr_t device_vtable = 0;
     std::memcpy(&device_vtable, device, sizeof(device_vtable));
-    if (!looks_like_d3d_vtable(device_vtable, d3d_base, d3d_size)) {
+
+    bool const same_module = device_vtable >= d3d_base
+        && device_vtable < d3d_base + d3d_size;
+    if (!same_module && !plausible_device_vtable(device_vtable)) {
         auto release = reinterpret_cast<fn_release>(vtable_slot(address, 2));
         if (release) {
             release(device);
@@ -1288,7 +1325,8 @@ bool try_accept_d3d_resource(std::uintptr_t resource, std::uintptr_t d3d_base, s
         release(device);
     }
 
-    std::snprintf(g_status, sizeof(g_status), "running");
+    std::snprintf(g_status, sizeof(g_status),
+        same_module ? "running" : "running (wrapped device)");
     return true;
 }
 
@@ -1407,14 +1445,14 @@ long __stdcall end_scene_hook(void* device) {
 // creator via GetDevice at vtable slot 3. Scanning for a resource and asking it
 // is far more reliable than trying to recognise the device by its vtable.
 void acquire_device(std::uintptr_t renderer) {
-    if (d3d_device_ || renderer == 0) {
+    if (d3d_device_ || renderer == 0 || g_device_attempts >= kMaxDeviceAttempts) {
         return;
     }
 
-    if (g_device_try_frame != 0 && g_frames - g_device_try_frame < 20) {
+    if (g_device_attempts != 0 && (g_frames % kDeviceRetryFrames) != 0) {
         return;
     }
-    g_device_try_frame = g_frames;
+    ++g_device_attempts;
 
     std::uintptr_t d3d_base = 0;
     std::size_t d3d_size = 0;
@@ -1423,10 +1461,12 @@ void acquire_device(std::uintptr_t renderer) {
         return;
     }
 
-    for (std::size_t offset = 0; offset + 4 <= 0x2000; offset += 4) {
+    // An unreadable slot is skipped rather than ending the scan; the renderer
+    // has gaps and the device resource can sit past them.
+    for (std::size_t offset = 0; offset + 4 <= kRendererScanWindow; offset += 4) {
         std::uintptr_t const slot = renderer + offset;
         if (!span_readable(slot, sizeof(std::uintptr_t))) {
-            break;
+            continue;
         }
 
         std::uintptr_t resource = 0;
@@ -1436,7 +1476,8 @@ void acquire_device(std::uintptr_t renderer) {
         }
     }
 
-    std::snprintf(g_status, sizeof(g_status), "device not found in renderer");
+    std::snprintf(g_status, sizeof(g_status), "device not found in renderer (try %lu)",
+        g_device_attempts);
 }
 
 bool page_executable(DWORD protect) {
@@ -1810,6 +1851,7 @@ bool remove_hook() {
     g_previous_hook = nullptr;
     g_last_seen_frames = 0;
     g_inner_ok_ms = 0;
+    g_device_attempts = 0;
     Sleep(60);
 
     if (g_trampoline_mem) {
@@ -1836,7 +1878,7 @@ int __cdecl lua_stop(lua_State* L) {
 int __cdecl lua_status(lua_State* L) {
     char report[320] {};
     std::snprintf(report, sizeof(report),
-        "n33 hooked=%s frames=%lu draws=%lu device=%08lX rings=%d | %s",
+        "n34 hooked=%s frames=%lu draws=%lu device=%08lX rings=%d | %s",
         g_hooked ? "yes" : "no", g_frames, g_draws,
         static_cast<unsigned long>(g_device), g_ring_count, g_status);
     g_lua.pushstring(L, report);
@@ -1992,7 +2034,7 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings(lua_State* L) {
 
     g_lua.createtable(L, 0, 11);
 
-    g_lua.pushstring(L, "1.9.9");
+    g_lua.pushstring(L, "1.9.4");
     g_lua.setfield(L, -2, "native");
 
     g_lua.pushcclosure(L, lua_start, 0);
@@ -2079,6 +2121,10 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings32(lua_State* L) {
 }
 
 extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings33(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings34(lua_State* L) {
     return luaopen__GEORings(L);
 }
 

@@ -12,7 +12,7 @@ add_library(_GEORings SHARED
 
 set_target_properties(_GEORings PROPERTIES
     PREFIX ""
-    OUTPUT_NAME "_GEORings33"
+    OUTPUT_NAME "_GEORings34"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../libs"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../libs"
 )
