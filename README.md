@@ -53,12 +53,7 @@ Job points are **+2s each, 20 cap = 40s**, added *before* the percent multiply.
 
 GEO-HUD does **not** talk to GearSwap. It follows outgoing equip packets (single-slot **0x050** and GearSwap’s bulk **0x051**), looks those items up in your bags, and keeps the **best** duration it sees. The countdown starts when the spell **lands**. It does **not** trust Windower’s “currently equipped” table at land time — that is often still Fast Cast or aftercast idle.
 
-The only manual value is Indicolure Duration job points in seconds (default **40**). Lower it only if yours is not maxed:
-
-```
-//geohud entrustjp 40
-//geohud entrustdur          — show last gear read and current JP
-```
+Indicolure Duration job points are read from your character (`job_points.geo`, +2s per rank, cap 40s). Gear is still sampled while you cast. `//geohud entrustjp` shows the current rank and seconds. `//geohud entrustdur` shows the last gear read.
 
 If no duration gear is seen during the cast (very short Fast Cast, inventory not ready), the timer is **180 + JP** so the bubble still goes away instead of hanging. That fallback is about **80s too short** vs a typical midcast set — if the HUD dies early, run `//geohud entrustdur` right after the cast; `0 flat, 0%` means the snapshot missed midcast.
 
@@ -81,6 +76,9 @@ Special thanks to Broguypal for sharing his [TargetRing](https://github.com/Brog
 
 
 
+### v2.0.3
+* Indicolure Duration job points are read from your character. `//geohud entrustjp` shows the current rank and seconds.
+
 ### v2.0.2
 * Range rings: `//geohud rangerings on` draws a thin element-coloured circle on the floor at the edge of each luopan, Indi, and Entrust bubble. Separate from the green/red tag rings.
 
@@ -89,7 +87,7 @@ Special thanks to Broguypal for sharing his [TargetRing](https://github.com/Brog
 * In Maquette Abdhaljs-Legion B (Ambuscade, zone 287) every enemy counts as tagged, because the party is already on the hate list.
 
 ### v2.0.1
-* Entrust on Trusts expires from a duration taken from the gear you wear while casting. Other party members still use Colure Active. `//geohud entrustjp` sets job points only (default 40). Midcast is sampled on equip swaps so Fast Cast no longer falls back to 180+JP. See [Entrust duration](#entrust-duration).
+* Entrust on Trusts expires from a duration taken from the gear you wear while casting. Other party members still use Colure Active. Midcast is sampled on equip swaps so Fast Cast no longer falls back to 180+JP. See [Entrust duration](#entrust-duration).
 
 * Colorblind mode brightens the Cardinal Chant N/S/E/W letters and draws a dark outline so they read more clearly.
 

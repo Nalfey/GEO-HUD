@@ -28,7 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 _addon.name = 'GEO-HUD'
 _addon.author = 'Nalfey'
-_addon.version = '2.0.2'
+_addon.version = '2.0.3'
 _addon.commands = {'geohud', 'gh'}
 
 require('tables')
@@ -91,8 +91,6 @@ local defaults = {
     orb_size = 72,
     orb_pad = 8,
     range_rings = true,
-    -- Indicolure Duration job points (+2s per rank). Gear is read from what you wear.
-    entrust_jp = 40,
     camera = {
         back = 6,
         height = 2.4,
@@ -112,9 +110,6 @@ if settings.cardinal_chant == nil then
 end
 if settings.range_rings == nil then
     settings.range_rings = true
-end
-if settings.entrust_jp == nil then
-    settings.entrust_jp = 40
 end
 if type(settings.camera) ~= 'table' then
     settings.camera = {}
@@ -141,7 +136,7 @@ settings.text.stroke.blue = 62
 -- can show different pieces. Position and the rest stay in data/settings.xml.
 -- Kept as one table so the main chunk stays under Lua's 200-local limit.
 local profile = {
-    keys = { 'show_hud', 'always_show', 'orbs', 'rings', 'range_rings', 'cardinal_chant', 'show_mobs', 'max_list', 'entrust_jp' },
+    keys = { 'show_hud', 'always_show', 'orbs', 'rings', 'range_rings', 'cardinal_chant', 'show_mobs', 'max_list' },
     base = {},
     char = nil,
     job = nil,
@@ -375,6 +370,31 @@ function indi.clamp(n, lo, hi, fallback)
         return hi
     end
     return n
+end
+
+-- Windower stores the Indicolure Duration category as a 0–20 rank.
+-- Each rank is +2s (cap 40s). The field name is Windower's spelling.
+function indi.jp_info()
+    local player = windower.ffxi.get_player()
+    local geo = player and player.job_points and player.job_points.geo
+    if not geo then
+        return nil
+    end
+    local rank = tonumber(geo.indocolure_spell_effect_dur)
+        or tonumber(geo.indicolure_spell_effect_dur)
+    if rank == nil then
+        return nil
+    end
+    rank = indi.clamp(rank, 0, 20, 0)
+    return { rank = rank, seconds = rank * 2 }
+end
+
+function indi.jp()
+    local info = indi.jp_info()
+    if not info then
+        return indi.jp_max
+    end
+    return info.seconds
 end
 
 function indi.clock(remain)
@@ -750,7 +770,7 @@ function indi.sample()
     if not flat then
         return
     end
-    local jp = indi.clamp(settings.entrust_jp, 0, indi.jp_max, indi.jp_max)
+    local jp = indi.jp()
     local dur = (indi.base + flat + jp) * (1 + pct / 100) + indi.delay
     if dur > indi.worn_best then
         indi.worn_best = dur
@@ -770,7 +790,7 @@ function indi.duration()
         flat = 0
         pct = 0
     end
-    local jp = indi.clamp(settings.entrust_jp, 0, indi.jp_max, indi.jp_max)
+    local jp = indi.jp()
     return (indi.base + flat + jp) * (1 + pct / 100) + indi.delay
 end
 
@@ -779,7 +799,7 @@ function indi.say(message)
 end
 
 function indi.report()
-    local jp = indi.clamp(settings.entrust_jp, 0, indi.jp_max, indi.jp_max)
+    local jp = indi.jp()
     indi.fill_missing_from_api()
     local now_flat, now_pct, now_names = indi.read_worn()
     if now_flat then
@@ -3225,7 +3245,8 @@ local function print_help()
     chat('  //geohud rings on|off     - in bubble only; debuff: green = tagged, red = untagged; buff: green = party')
     chat('  //geohud rangerings on|off - thin element-coloured floor ring at the bubble edge (luopan, Indi, Entrust)')
     chat('  //geohud cardinalchant on|off - N blue crit, E red MAB, S green macc, W yellow MB')
-    chat('  //geohud entrustjp [0-40] - Indicolure Duration JP seconds (default 40); gear is read while you cast')
+    chat('  //geohud entrustjp         - show this character\'s Indicolure Duration JP')
+    chat('  //geohud entrustdur        - show last Entrust gear sample and Indicolure JP')
     chat('  //geohud colorblind on|off - X on red rings, O on green rings')
     chat('  //geohud rings status     - native ring module hook/device state')
     chat('  //geohud mobs on|off      - nearby mob list under the HUD (off by default)')
@@ -3578,7 +3599,7 @@ windower.register_event('addon command', function(command, ...)
             settings.range_rings and 'on' or 'off',
             settings.cardinal_chant and 'on' or 'off',
             settings.show_mobs and 'on' or 'off'))
-        chat(('  entrust jp=%s'):format(tostring(settings.entrust_jp or indi.jp_max)))
+        chat(('  indicolure jp=%ds (from job points)'):format(indi.jp()))
         indi.report()
     elseif command == 'save' then
         local arg = args[1] and args[1]:lower()
@@ -3741,27 +3762,16 @@ windower.register_event('addon command', function(command, ...)
         end
         chat('Cardinal Chant circle ' .. (settings.cardinal_chant and 'on' or 'off')
             .. '  (N blue crit, E red MAB, S green macc, W yellow MB).')
-    elseif command == 'entrustdur' or command == 'indidur' or command == 'entrustduration' or command == 'entrustjp' then
-        local a = tonumber(args[1])
-        local b = tonumber(args[2])
-        local c = tonumber(args[3])
-        if b then
-            chat('Duration gear is read from what you wear during the Entrust Indi. Do not add pants, cape, or Gada by hand.')
-            if c then
-                settings.entrust_jp = indi.clamp(c, 0, indi.jp_max, indi.jp_max)
-                profile.save()
-                chat(('Indicolure Duration JP set to %d.'):format(settings.entrust_jp))
-            else
-                chat('Only job points are set by hand: //geohud entrustjp <0-40>  (default 40).')
-            end
-            indi.report()
+    elseif command == 'entrustjp' then
+        local info = indi.jp_info()
+        local player = windower.ffxi.get_player()
+        local who = player and player.name or 'current player'
+        if not info then
+            chat('Could not read GEO job points for ' .. who .. '.')
             return
         end
-        if a then
-            settings.entrust_jp = indi.clamp(a, 0, indi.jp_max, indi.jp_max)
-            profile.save()
-            chat(('Indicolure Duration JP set to %d.'):format(settings.entrust_jp))
-        end
+        chat(('Indicolure Duration JP for %s: %d / 20  (+%ds)'):format(who, info.rank, info.seconds))
+    elseif command == 'entrustdur' or command == 'indidur' or command == 'entrustduration' then
         indi.report()
     elseif command == 'ipc' then
         local arg = args[1] and args[1]:lower()
