@@ -8,6 +8,10 @@ Windower 4 addon for Geomancer Luopan / Indi / Entrust tracking and ground rings
 
 ![GEO-HUD 03](https://i.ibb.co/V4DGVRS/GEO-HUD-03.jpg)
 
+![GEO-HUD 04](https://i.ibb.co/99J535Kw/GEO-HUD-11-JPG.jpg)
+
+![GEO-HUD 05](https://i.ibb.co/NdwrHWS0/GEO-HUD-12-JPG.jpg)
+
 
 ## Install
 
