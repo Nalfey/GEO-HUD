@@ -80,9 +80,12 @@ constexpr float kGroundClearance = 0.05f;
 constexpr float kSmoothBlend = 0.72f;
 constexpr float kTwoPi = 6.28318530718f;
 constexpr float kRearFade = 0.120f;
+constexpr float kRangeRearFade = 0.220f;
 constexpr float kFadeCurve = 0.500f;
 constexpr float kPulseDepth = 0.200f;
 constexpr float kGlowAlpha = 0.200f;
+constexpr float kPlayerBodyHeight = 1.72f;
+constexpr float kPlayerOccludeRadius = 0.42f;
 constexpr unsigned kPulsePeriodMs = 800u;
 constexpr DWORD kMaxIndex = 0x900;
 // entity+0x004 is the client's *predicted* position and leads the mesh while a
@@ -108,6 +111,7 @@ DWORD g_player_index = 0;
 Position g_player_pos {};
 bool g_player_has_pos = false;
 bool g_player_occluder_valid = false;
+bool g_soft_player_cutout = false;
 float g_player_foot_x = 0.0f;
 float g_player_foot_y = 0.0f;
 float g_player_head_x = 0.0f;
@@ -117,6 +121,11 @@ int g_active_slices = ring_slices_max_;
 bool g_draw_outer_glow = true;
 bool g_colorblind = false;
 Ring g_chant {};
+constexpr int kMaxRangeRings = 8;
+Ring g_range[kMaxRangeRings] {};
+Ring g_range_staging[kMaxRangeRings] {};
+int g_range_count = 0;
+int g_range_staging_count = 0;
 
 struct CompassMark {
     float x = -1.0f;
@@ -395,8 +404,88 @@ DWORD scale_alpha(DWORD color, float scale) {
     return (clamped << 24) | (color & 0x00FFFFFF);
 }
 
+DWORD mix_rgb(DWORD color, DWORD other, float t) {
+    if (t <= 0.0f) {
+        return color;
+    }
+    if (t >= 1.0f) {
+        return (color & 0xFF000000u) | (other & 0x00FFFFFFu);
+    }
+    auto channel = [](DWORD value, int shift) {
+        return static_cast<int>((value >> shift) & 0xFF);
+    };
+    int const r = channel(color, 16) + static_cast<int>((channel(other, 16) - channel(color, 16)) * t + 0.5f);
+    int const g = channel(color, 8) + static_cast<int>((channel(other, 8) - channel(color, 8)) * t + 0.5f);
+    int const b = channel(color, 0) + static_cast<int>((channel(other, 0) - channel(color, 0)) * t + 0.5f);
+    return (color & 0xFF000000u)
+        | (static_cast<DWORD>(r) << 16)
+        | (static_cast<DWORD>(g) << 8)
+        | static_cast<DWORD>(b);
+}
+
+DWORD retint_range(DWORD color) {
+    float r = static_cast<float>((color >> 16) & 0xFF) / 255.0f;
+    float g = static_cast<float>((color >> 8) & 0xFF) / 255.0f;
+    float b = static_cast<float>(color & 0xFF) / 255.0f;
+    float const maxc = std::fmax(r, std::fmax(g, b));
+    float const minc = std::fmin(r, std::fmin(g, b));
+    float const delta = maxc - minc;
+    float h = 0.0f;
+    float s = 0.0f;
+    if (maxc > 0.0001f) {
+        s = delta / maxc;
+        if (delta > 0.0001f) {
+            if (maxc == r) {
+                h = (g - b) / delta + (g < b ? 6.0f : 0.0f);
+            } else if (maxc == g) {
+                h = (b - r) / delta + 2.0f;
+            } else {
+                h = (r - g) / delta + 4.0f;
+            }
+            h /= 6.0f;
+        }
+    }
+    s = std::fmin(1.0f, s * 1.3f);
+    float const v = maxc * 0.5f;
+    float const hue = h * 6.0f;
+    int const sector = static_cast<int>(hue) % 6;
+    float const f = hue - std::floor(hue);
+    float const p = v * (1.0f - s);
+    float const q = v * (1.0f - f * s);
+    float const t = v * (1.0f - (1.0f - f) * s);
+    switch (sector) {
+    case 0: r = v; g = t; b = p; break;
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    default: r = v; g = p; b = q; break;
+    }
+    auto byte = [](float c) {
+        return static_cast<DWORD>(std::fmax(0.0f, std::fmin(255.0f, c * 255.0f)) + 0.5f);
+    };
+    return (color & 0xFF000000u) | (byte(r) << 16) | (byte(g) << 8) | byte(b);
+}
+
+DWORD boost_chant_letter(DWORD color) {
+    int r = static_cast<int>((color >> 16) & 0xFF);
+    int g = static_cast<int>((color >> 8) & 0xFF);
+    int b = static_cast<int>(color & 0xFF);
+    r = (r * 2 + 255) / 3 + 40;
+    g = (g * 2 + 255) / 3 + 40;
+    b = (b * 2 + 255) / 3 + 40;
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    return 0xFF000000u
+        | (static_cast<DWORD>(r) << 16)
+        | (static_cast<DWORD>(g) << 8)
+        | static_cast<DWORD>(b);
+}
+
 float g_fade_hub = 0.0f;
 float g_fade_span = 1.0f;
+float g_fade_floor = kRearFade;
 
 float distance_fade(float distance) {
     if (g_fade_span <= 0.0f) {
@@ -405,7 +494,43 @@ float distance_fade(float distance) {
 
     float t = (distance - g_fade_hub) / g_fade_span;
     t = std::fmax(0.0f, std::fmin(1.0f, t));
-    return 1.0f - (1.0f - kRearFade) * std::pow(t, kFadeCurve);
+    return 1.0f - (1.0f - g_fade_floor) * std::pow(t, kFadeCurve);
+}
+
+float point_to_segment(float px, float py, float ax, float ay, float bx, float by) {
+    const float dx = bx - ax;
+    const float dy = by - ay;
+    const float length_sq = dx * dx + dy * dy;
+    float t = 0.0f;
+    if (length_sq > 0.0001f) {
+        t = ((px - ax) * dx + (py - ay) * dy) / length_sq;
+        t = std::fmax(0.0f, std::fmin(1.0f, t));
+    }
+    const float qx = ax + t * dx;
+    const float qy = ay + t * dy;
+    return std::hypot(px - qx, py - qy);
+}
+
+float player_cover(float screen_x, float screen_y) {
+    if (!g_soft_player_cutout || !g_player_occluder_valid) {
+        return 0.0f;
+    }
+    const float distance = point_to_segment(screen_x, screen_y,
+        g_player_foot_x, g_player_foot_y, g_player_head_x, g_player_head_y);
+    const float inner = g_player_half_width * 0.70f;
+    const float outer = g_player_half_width * 1.40f;
+    if (distance <= inner) {
+        return 1.0f;
+    }
+    if (distance >= outer) {
+        return 0.0f;
+    }
+    const float t = (outer - distance) / (outer - inner);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+DWORD shaded_color(DWORD color, float screen_x, float screen_y, float distance) {
+    return scale_alpha(color, distance_fade(distance) * (1.0f - player_cover(screen_x, screen_y)));
 }
 
 void update_draw_quality() {
@@ -616,8 +741,8 @@ void draw_ground_ring(const Position& centre, float radius,
             continue;
         }
 
-        inner_color[i] = scale_alpha(color, distance_fade(1.0f / inner_rhw));
-        outer_color[i] = scale_alpha(color, distance_fade(1.0f / outer_rhw));
+        inner_color[i] = shaded_color(color, inner_x[i], inner_y[i], 1.0f / inner_rhw);
+        outer_color[i] = shaded_color(color, outer_x[i], outer_y[i], 1.0f / outer_rhw);
     }
 
     DrawVertex quad[6] {};
@@ -656,7 +781,7 @@ bool emit_quad(const Position& a, const Position& b, const Position& c, const Po
         }
         screen[i].z = depth;
         screen[i].rhw = rhw;
-        screen[i].color = scale_alpha(color, distance_fade(1.0f / rhw));
+        screen[i].color = shaded_color(color, screen[i].x, screen[i].y, 1.0f / rhw);
     }
 
     DrawVertex quad[6] = {
@@ -743,8 +868,8 @@ void draw_marker_annulus(const Position& origin, float radius, float width,
         if (!resolved[i]) {
             continue;
         }
-        inner_color[i] = scale_alpha(color, distance_fade(1.0f / inner_rhw));
-        outer_color[i] = scale_alpha(color, distance_fade(1.0f / outer_rhw));
+        inner_color[i] = shaded_color(color, inner_x[i], inner_y[i], 1.0f / inner_rhw);
+        outer_color[i] = shaded_color(color, outer_x[i], outer_y[i], 1.0f / outer_rhw);
     }
 
     DrawVertex quad[6] {};
@@ -926,8 +1051,71 @@ Position smooth_ring_position(DWORD index, Position const& target) {
     return state.pos;
 }
 
-void refresh_player_occluder(const D3DVIEWPORT8&) {
+void refresh_player_occluder(const D3DVIEWPORT8& viewport) {
     g_player_occluder_valid = false;
+    Position root {};
+    DWORD index = g_player_index;
+    if (index == 0 && g_chant.active) {
+        index = g_chant.index;
+    }
+    if (index != 0 && live_position(index, root)) {
+        // live entity pose
+    } else if (g_player_has_pos) {
+        root = g_player_pos;
+    } else {
+        return;
+    }
+
+    const Position feet {root.east, root.north, root.height};
+    const Position plus {root.east, root.north, root.height + kPlayerBodyHeight};
+    const Position minus {root.east, root.north, root.height - kPlayerBodyHeight};
+    const Position side {root.east + kPlayerOccludeRadius, root.north, root.height};
+
+    float foot_x = 0.0f;
+    float foot_y = 0.0f;
+    float foot_rhw = 1.0f;
+    if (!world_to_screen(feet, viewport, foot_x, foot_y, foot_rhw) || foot_rhw <= 0.0f) {
+        return;
+    }
+
+    // World "up" can land toward the camera in FFXI's view, which put the old
+    // capsule in front of the character (a hole by the near edge). Measure the
+    // body span, then always plant the capsule upward on screen from the feet.
+    float plus_x = 0.0f;
+    float plus_y = 0.0f;
+    float plus_rhw = 1.0f;
+    float minus_x = 0.0f;
+    float minus_y = 0.0f;
+    float minus_rhw = 1.0f;
+    const bool plus_ok = world_to_screen(plus, viewport, plus_x, plus_y, plus_rhw)
+        && plus_rhw > 0.0f;
+    const bool minus_ok = world_to_screen(minus, viewport, minus_x, minus_y, minus_rhw)
+        && minus_rhw > 0.0f;
+
+    float span = 72.0f;
+    if (plus_ok && minus_ok) {
+        span = std::hypot(plus_x - minus_x, plus_y - minus_y);
+    } else if (plus_ok) {
+        span = std::hypot(plus_x - foot_x, plus_y - foot_y);
+    } else if (minus_ok) {
+        span = std::hypot(minus_x - foot_x, minus_y - foot_y);
+    }
+    span = std::fmax(36.0f, std::fmin(span, 220.0f));
+
+    g_player_foot_x = foot_x;
+    g_player_foot_y = foot_y;
+    g_player_head_x = foot_x;
+    g_player_head_y = foot_y - span;
+
+    g_player_half_width = 18.0f;
+    float side_x = 0.0f;
+    float side_y = 0.0f;
+    float side_rhw = 1.0f;
+    if (world_to_screen(side, viewport, side_x, side_y, side_rhw) && side_rhw > 0.0f) {
+        g_player_half_width = std::hypot(side_x - foot_x, side_y - foot_y);
+    }
+    g_player_half_width = std::fmax(10.0f, std::fmin(g_player_half_width, 90.0f));
+    g_player_occluder_valid = true;
 }
 
 void lock_rings() {
@@ -1017,7 +1205,47 @@ bool rasterize_arial_bold() {
 
 // Arial Bold N/E/S/W laid flat on the ground with the chant ring. Each letter
 // sits on the outer glow; the top of the glyph points outward so they read as
-// compass marks. Tinted with the live ring colour at 80% opacity.
+// compass marks. Tinted with the live ring colour at 80% opacity. Colorblind
+// mode adds a dark outline and a brighter fill so the letters stay readable.
+void emit_chant_glyph(ArialGlyph const& glyph, const Position& origin, float h,
+    float cell, float re, float rn, float oe, float on,
+    const D3DVIEWPORT8& viewport, DWORD fill, int min_cov) {
+    if (glyph.w <= 0 || glyph.h <= 0) {
+        return;
+    }
+
+    const float half_w = static_cast<float>(glyph.w) * cell * 0.5f;
+    const float half_h = static_cast<float>(glyph.h) * cell * 0.5f;
+
+    for (int r = 0; r < glyph.h; ++r) {
+        for (int c = 0; c < glyph.w; ++c) {
+            const unsigned char cov = glyph.pixels[r * 96 + c];
+            if (cov < min_cov) {
+                continue;
+            }
+            const DWORD pix = scale_alpha(fill, static_cast<float>(cov) / 64.0f);
+            const float u0 = -half_w + static_cast<float>(c) * cell;
+            const float u1 = u0 + cell;
+            const float v0 = half_h - static_cast<float>(r) * cell;
+            const float v1 = v0 - cell;
+
+            const Position a {
+                origin.east + re * u0 + oe * v0,
+                origin.north + rn * u0 + on * v0, h};
+            const Position b {
+                origin.east + re * u1 + oe * v0,
+                origin.north + rn * u1 + on * v0, h};
+            const Position cpos {
+                origin.east + re * u1 + oe * v1,
+                origin.north + rn * u1 + on * v1, h};
+            const Position d {
+                origin.east + re * u0 + oe * v1,
+                origin.north + rn * u0 + on * v1, h};
+            emit_quad(a, b, cpos, d, viewport, pix);
+        }
+    }
+}
+
 void draw_chant_compass(const Position& centre, float radius,
     const D3DVIEWPORT8& viewport, DWORD color) {
     if ((color & 0xFF000000u) == 0 || !rasterize_arial_bold()) {
@@ -1032,13 +1260,13 @@ void draw_chant_compass(const Position& centre, float radius,
         {centre.east, centre.north - dist, h},
         {centre.east - dist, centre.north, h},
     };
-    // Outward / right in (east, north) for N, E, S, W.
     const float out_e[4] = { 0.0f,  1.0f,  0.0f, -1.0f };
     const float out_n[4] = { 1.0f,  0.0f, -1.0f,  0.0f };
     const float right_e[4] = { 1.0f,  0.0f, -1.0f,  0.0f };
     const float right_n[4] = { 0.0f, -1.0f,  0.0f,  1.0f };
 
-    const DWORD fill = scale_alpha(color, 0.80f);
+    const DWORD fill = g_colorblind ? boost_chant_letter(color) : scale_alpha(color, 0.80f);
+    constexpr DWORD kOutline = 0xF2000000;
 
     for (int i = 0; i < 4; ++i) {
         CompassMark mark {};
@@ -1059,38 +1287,38 @@ void draw_chant_compass(const Position& centre, float radius,
 
         const float world_h = dist * 0.195f;
         const float cell = world_h / static_cast<float>(glyph.h);
-        const float half_w = static_cast<float>(glyph.w) * cell * 0.5f;
-        const float half_h = static_cast<float>(glyph.h) * cell * 0.5f;
         const Position origin = points[i];
 
-        for (int r = 0; r < glyph.h; ++r) {
-            for (int c = 0; c < glyph.w; ++c) {
-                const unsigned char cov = glyph.pixels[r * 96 + c];
-                if (cov < 8) {
-                    continue;
-                }
-                const DWORD pix = scale_alpha(fill, static_cast<float>(cov) / 64.0f);
-                const float u0 = -half_w + static_cast<float>(c) * cell;
-                const float u1 = u0 + cell;
-                const float v0 = half_h - static_cast<float>(r) * cell;
-                const float v1 = v0 - cell;
-
-                const Position a {
-                    origin.east + right_e[i] * u0 + out_e[i] * v0,
-                    origin.north + right_n[i] * u0 + out_n[i] * v0, h};
-                const Position b {
-                    origin.east + right_e[i] * u1 + out_e[i] * v0,
-                    origin.north + right_n[i] * u1 + out_n[i] * v0, h};
-                const Position cpos {
-                    origin.east + right_e[i] * u1 + out_e[i] * v1,
-                    origin.north + right_n[i] * u1 + out_n[i] * v1, h};
-                const Position d {
-                    origin.east + right_e[i] * u0 + out_e[i] * v1,
-                    origin.north + right_n[i] * u0 + out_n[i] * v1, h};
-                emit_quad(a, b, cpos, d, viewport, pix);
+        if (g_colorblind) {
+            const float halo = cell * 1.45f;
+            const float ox[4] = { -halo, halo, 0.0f, 0.0f };
+            const float oy[4] = { 0.0f, 0.0f, -halo, halo };
+            for (int k = 0; k < 4; ++k) {
+                const Position rim {
+                    origin.east + right_e[i] * ox[k] + out_e[i] * oy[k],
+                    origin.north + right_n[i] * ox[k] + out_n[i] * oy[k],
+                    h};
+                emit_chant_glyph(glyph, rim, h, cell, right_e[i], right_n[i],
+                    out_e[i], out_n[i], viewport, kOutline, 4);
             }
         }
+
+        emit_chant_glyph(glyph, origin, h, cell, right_e[i], right_n[i],
+            out_e[i], out_n[i], viewport, fill, 8);
     }
+}
+
+void draw_range_guide(const Position& centre, float radius, const D3DVIEWPORT8& viewport, DWORD color) {
+    if (radius <= 0.0f) {
+        return;
+    }
+    if (color == 0) {
+        color = 0xFFFFFCD2;
+    }
+    color = retint_range(color);
+    // +25% opacity from the previous pass (0.10 / 0.238).
+    draw_ground_ring(centre, radius, 0.16f, viewport, scale_alpha(color, 0.125f));
+    draw_ground_ring(centre, radius, 0.055f, viewport, scale_alpha(mix_rgb(color, 0xFFFFFFFFu, 0.25f), 0.298f));
 }
 
 void draw_all_rings() {
@@ -1100,7 +1328,9 @@ void draw_all_rings() {
 
     Ring rings[kMaxRings] {};
     Ring chant {};
+    Ring range_rings[kMaxRangeRings] {};
     int count = 0;
+    int range_count = 0;
     lock_rings();
     count = g_ring_count;
     if (count > kMaxRings) {
@@ -1110,11 +1340,18 @@ void draw_all_rings() {
         std::memcpy(rings, g_rings, static_cast<std::size_t>(count) * sizeof(Ring));
     }
     chant = g_chant;
+    range_count = g_range_count;
+    if (range_count > kMaxRangeRings) {
+        range_count = kMaxRangeRings;
+    }
+    if (range_count > 0) {
+        std::memcpy(range_rings, g_range, static_cast<std::size_t>(range_count) * sizeof(Ring));
+    }
     g_draw_samples_fresh = g_samples_fresh;
     g_samples_fresh = false;
     unlock_rings();
 
-    if (count <= 0 && !chant.active) {
+    if (count <= 0 && !chant.active && range_count <= 0) {
         g_compass[0].ok = g_compass[1].ok = g_compass[2].ok = g_compass[3].ok = false;
         return;
     }
@@ -1172,6 +1409,14 @@ void draw_all_rings() {
         }
     }
 
+    // Cardinal Chant and range rings skip the depth test so hills do not eat
+    // the circle. Tag rings keep hardware Z so they tuck behind characters.
+    // With Z off we restore rear-depth fade and a soft local-player cutout.
+    flush_batch();
+    dev_SetRenderState(D3DRS_ZENABLE, FALSE);
+    g_soft_player_cutout = true;
+    refresh_player_occluder(viewport);
+
     if (chant.active && chant.radius > 0.0f) {
         Position centre {};
         if (!live_position(chant.index, centre)) {
@@ -1197,11 +1442,35 @@ void draw_all_rings() {
             viewport, scale_alpha(chant.color, 0.95f * pulse));
 
         draw_chant_compass(centre, chant.radius, viewport,
-            scale_alpha(chant.color, 0.95f * pulse));
+            g_colorblind ? chant.color : scale_alpha(chant.color, 0.95f * pulse));
     } else {
         g_compass[0].ok = g_compass[1].ok = g_compass[2].ok = g_compass[3].ok = false;
     }
 
+    for (int i = 0; i < range_count; ++i) {
+        Ring const& ring = range_rings[i];
+        if (!ring.active || ring.radius <= 0.0f) {
+            continue;
+        }
+        Position centre {};
+        if (!live_position(ring.index, centre)) {
+            centre = smooth_ring_position(ring.index, ring.centre);
+        }
+        const Position hub {centre.east, centre.north, centre.height - kGroundClearance};
+        float hx = 0.0f;
+        float hy = 0.0f;
+        float hrhw = 1.0f;
+        if (world_to_screen(hub, viewport, hx, hy, hrhw) && hrhw > 0.0f) {
+            g_fade_hub = 1.0f / hrhw;
+            g_fade_span = ring.radius;
+        } else {
+            g_fade_span = 0.0f;
+        }
+        g_fade_floor = kRangeRearFade;
+        draw_range_guide(centre, ring.radius, viewport, ring.color);
+        g_fade_floor = kRearFade;
+    }
+    g_soft_player_cutout = false;
     flush_batch();
     end_draw_state();
     ++g_draws;
@@ -1486,7 +1755,7 @@ int __cdecl lua_status(lua_State* L) {
 
     char report[512] {};
     std::snprintf(report, sizeof(report),
-        "n36 drawing=%s frames=%lu draws=%lu device=%08lX rings=%d | %s | %s",
+        "n46 drawing=%s frames=%lu draws=%lu device=%08lX rings=%d | %s | %s",
         g_hooked ? "yes" : "no", g_frames, g_draws,
         static_cast<unsigned long>(g_device), g_ring_count, g_status, bus);
     g_lua.pushstring(L, report);
@@ -1551,6 +1820,48 @@ int __cdecl lua_chant(lua_State* L) {
     lock_rings();
     g_chant = ring;
     unlock_rings();
+    return 0;
+}
+
+int __cdecl lua_range_clear(lua_State* L) {
+    g_range_staging_count = 0;
+    for (int i = 0; i < kMaxRangeRings; ++i) {
+        g_range_staging[i].active = false;
+    }
+    (void)L;
+    return 0;
+}
+
+int __cdecl lua_range_add(lua_State* L) {
+    if (g_lua.gettop(L) < 5) {
+        return 0;
+    }
+    int const slot = g_range_staging_count;
+    if (slot >= kMaxRangeRings) {
+        return 0;
+    }
+    Ring ring {};
+    ring.index = static_cast<DWORD>(g_lua.tonumber(L, 1));
+    ring.centre.east = static_cast<float>(g_lua.tonumber(L, 2));
+    ring.centre.north = static_cast<float>(g_lua.tonumber(L, 3));
+    ring.centre.height = static_cast<float>(g_lua.tonumber(L, 4));
+    ring.radius = static_cast<float>(g_lua.tonumber(L, 5));
+    ring.color = g_lua.gettop(L) >= 6
+        ? static_cast<DWORD>(g_lua.tonumber(L, 6))
+        : 0xFFFFFCD2;
+    ring.active = ring.index != 0 && ring.radius > 0.0f;
+    g_range_staging[slot] = ring;
+    g_range_staging_count = slot + 1;
+    return 0;
+}
+
+int __cdecl lua_range_commit(lua_State* L) {
+    lock_rings();
+    std::memcpy(g_range, g_range_staging, sizeof(g_range));
+    g_range_count = g_range_staging_count;
+    g_samples_fresh = true;
+    unlock_rings();
+    (void)L;
     return 0;
 }
 
@@ -1644,9 +1955,9 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings(lua_State* L) {
     g_ring_count = 0;
     unlock_rings();
 
-    g_lua.createtable(L, 0, 11);
+    g_lua.createtable(L, 0, 14);
 
-    g_lua.pushstring(L, "2.0.0");
+    g_lua.pushstring(L, "2.0.6");
     g_lua.setfield(L, -2, "native");
 
     g_lua.pushcclosure(L, lua_start, 0);
@@ -1675,6 +1986,15 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings(lua_State* L) {
 
     g_lua.pushcclosure(L, lua_chant, 0);
     g_lua.setfield(L, -2, "chant");
+
+    g_lua.pushcclosure(L, lua_range_clear, 0);
+    g_lua.setfield(L, -2, "range_clear");
+
+    g_lua.pushcclosure(L, lua_range_add, 0);
+    g_lua.setfield(L, -2, "range_add");
+
+    g_lua.pushcclosure(L, lua_range_commit, 0);
+    g_lua.setfield(L, -2, "range_commit");
 
     g_lua.pushcclosure(L, lua_compass, 0);
     g_lua.setfield(L, -2, "compass");
@@ -1745,6 +2065,46 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings35(lua_State* L) {
 }
 
 extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings36(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings37(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings38(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings39(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings40(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings41(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings42(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings43(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings44(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings45(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings46(lua_State* L) {
     return luaopen__GEORings(L);
 }
 

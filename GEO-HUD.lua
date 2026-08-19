@@ -28,7 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 _addon.name = 'GEO-HUD'
 _addon.author = 'Nalfey'
-_addon.version = '2.0.0'
+_addon.version = '2.0.2'
 _addon.commands = {'geohud', 'gh'}
 
 require('tables')
@@ -55,6 +55,10 @@ local C = {
     radius = 6,
     -- Action categories that can generate enmity when they finish.
     tags = S{1, 2, 3, 4, 5, 6, 13, 14, 15},
+    -- Zones where the party is already on every mob's hate list.
+    auto_tag_zones = S{
+        287, -- Maquette Abdhaljs-Legion B (Ambuscade)
+    },
 }
 
 local defaults = {
@@ -86,6 +90,9 @@ local defaults = {
     orbs = true,
     orb_size = 72,
     orb_pad = 8,
+    range_rings = true,
+    -- Indicolure Duration job points (+2s per rank). Gear is read from what you wear.
+    entrust_jp = 40,
     camera = {
         back = 6,
         height = 2.4,
@@ -102,6 +109,12 @@ if settings.colorblind == nil then
 end
 if settings.cardinal_chant == nil then
     settings.cardinal_chant = false
+end
+if settings.range_rings == nil then
+    settings.range_rings = true
+end
+if settings.entrust_jp == nil then
+    settings.entrust_jp = 40
 end
 if type(settings.camera) ~= 'table' then
     settings.camera = {}
@@ -128,7 +141,7 @@ settings.text.stroke.blue = 62
 -- can show different pieces. Position and the rest stay in data/settings.xml.
 -- Kept as one table so the main chunk stays under Lua's 200-local limit.
 local profile = {
-    keys = { 'show_hud', 'always_show', 'orbs', 'rings', 'cardinal_chant', 'show_mobs', 'max_list' },
+    keys = { 'show_hud', 'always_show', 'orbs', 'rings', 'range_rings', 'cardinal_chant', 'show_mobs', 'max_list', 'entrust_jp' },
     base = {},
     char = nil,
     job = nil,
@@ -343,11 +356,463 @@ local last_indi_element = nil
 local last_indi_status = nil
 local last_indi_cast = 0
 local MAX_ENTRUST = 5
-local entrusted = {} -- {id, name, spell, element, cast}
+local entrusted = {} -- {id, name, spell, element, cast, expires, npc}
+
+-- Duration for Entrust we cast. Watchers of another GEO still use 0x076 Colure.
+-- BG Wiki Indicolure: (180 + flat seconds + JP seconds) × (1 + augment%/100).
+-- JP category is +2s per point, cap 20 → 40s. +1s slack so the HUD is not early.
+local indi = { base = 180, jp_max = 40, delay = 1 }
+
+function indi.clamp(n, lo, hi, fallback)
+    n = tonumber(n)
+    if n == nil then
+        return fallback
+    end
+    if n < lo then
+        return lo
+    end
+    if n > hi then
+        return hi
+    end
+    return n
+end
+
+function indi.clock(remain)
+    remain = math.max(0, math.floor(remain + 0.5))
+    return ('%d:%02d'):format(math.floor(remain / 60), remain % 60)
+end
+
+-- Trusts often have no loaded .mob when they are far away, so also match by name.
+function indi.party_has(id, name)
+    if not id then
+        return false
+    end
+    local party = windower.ffxi.get_party()
+    if not party then
+        return false
+    end
+    for i = 0, 5 do
+        local p = party['p' .. i]
+        if p then
+            if p.mob and p.mob.id == id then
+                return true
+            end
+            if name and p.name == name then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- Snapshot club/legs/feet/back while the Entrust Indi is casting. Precast Fast
+-- Cast is already on before category 8, so sample immediately and again on every
+-- equip packet (GearSwap midcast). Do not read gear when the spell lands —
+-- that is aftercast. If nothing with duration is seen, fall back to 180 + JP.
+indi.worn_best = -1
+indi.slots = { 'main', 'sub', 'legs', 'feet', 'back' }
+indi.bag_key = {
+    [0] = 'inventory',
+    [8] = 'wardrobe',
+    [10] = 'wardrobe2',
+    [11] = 'wardrobe3',
+    [12] = 'wardrobe4',
+    [13] = 'wardrobe5',
+    [14] = 'wardrobe6',
+    [15] = 'wardrobe7',
+    [16] = 'wardrobe8',
+}
+
+function indi.item_name(item)
+    if not item or not item.id or item.id == 0 then
+        return nil
+    end
+    local info = res.items[item.id]
+    return info and (info.en or info.english)
+end
+
+function indi.item_desc(item)
+    if not item or not item.id or item.id == 0 then
+        return nil
+    end
+    local info = res.items[item.id]
+    if not info then
+        return nil
+    end
+    local d = info.description
+    if type(d) == 'table' then
+        d = d[1] or d.en or d.english
+    end
+    if type(d) == 'string' and d ~= '' then
+        return d
+    end
+    return nil
+end
+
+function indi.flat_for_name(name)
+    if not name then
+        return 0
+    end
+    name = name:lower()
+    if name:find('bagua pants', 1, true) then
+        if name:find('+4', 1, true) or name:find('+3', 1, true) then return 21 end
+        if name:find('+2', 1, true) then return 18 end
+        if name:find('+1', 1, true) then return 15 end
+        return 12
+    end
+    if name:find('azimuth gaiters', 1, true) then
+        if name:find('+3', 1, true) then return 30 end
+        if name:find('+2', 1, true) then return 25 end
+        if name:find('+1', 1, true) then return 20 end
+        return 15
+    end
+    if name:find('nantosuelta', 1, true) then
+        return 20
+    end
+    if name:find('solstice', 1, true) then
+        return 15
+    end
+    return 0
+end
+
+function indi.parse_duration_text(text)
+    local flat, pct = 0, 0
+    if type(text) ~= 'string' then
+        return 0, 0
+    end
+    for chunk in (text .. '\n'):gmatch('([^\r\n]+)') do
+        local low = chunk:lower()
+        if low:find('indi', 1, true) and low:find('dur', 1, true) then
+            local n, mark = low:match('([%+%-]?%d+)%s*(%%?)')
+            n = tonumber(n)
+            if n and n > 0 then
+                -- Gada / Lifestream use "Indi. eff. dur. +N" with no % sign, but it is percent.
+                if mark == '%' or low:find('eff', 1, true) then
+                    pct = pct + n
+                else
+                    flat = flat + n
+                end
+            end
+        end
+    end
+    return flat, pct
+end
+
+function indi.augments_of(item)
+    if not item then
+        return nil
+    end
+    if type(item.augments) == 'table' then
+        return item.augments
+    end
+    if indi.ext == false or not item.extdata then
+        return nil
+    end
+    if indi.ext == nil then
+        local ok, lib = pcall(require, 'extdata')
+        indi.ext = (ok and lib) or false
+    end
+    if not indi.ext or not indi.ext.decode then
+        return nil
+    end
+    local ok, parsed = pcall(indi.ext.decode, { id = item.id, extdata = item.extdata })
+    if ok and parsed and type(parsed.augments) == 'table' then
+        return parsed.augments
+    end
+    return nil
+end
+
+function indi.bonus_from_augments(augs)
+    local flat, pct = 0, 0
+    if type(augs) ~= 'table' then
+        return 0, 0
+    end
+    for i = 1, #augs do
+        local add_flat, add_pct = indi.parse_duration_text(augs[i])
+        flat = flat + add_flat
+        pct = pct + add_pct
+    end
+    return flat, pct
+end
+
+function indi.copy_item(item)
+    if not item or not item.id or item.id == 0 then
+        return nil
+    end
+    return { id = item.id, extdata = item.extdata, augments = item.augments }
+end
+
+function indi.lookup_bag_item(bag_id, index)
+    index = tonumber(index) or 0
+    if index == 0 then
+        return nil
+    end
+    local items = windower.ffxi.get_items()
+    if not items then
+        return nil
+    end
+    local key = indi.bag_key[tonumber(bag_id) or 0]
+    local bag = (key and items[key]) or items[tonumber(bag_id) or 0]
+    local item = bag and bag[index]
+    if (not item or not item.id or item.id == 0) then
+        item = windower.ffxi.get_items(tonumber(bag_id) or 0, index)
+    end
+    return indi.copy_item(item)
+end
+
+function indi.equipped_item(items, slot)
+    local eq = items.equipment
+    local index = tonumber(eq[slot]) or 0
+    if index == 0 then
+        return nil
+    end
+    local bag_id = tonumber(eq[slot .. '_bag']) or 0
+    return indi.lookup_bag_item(bag_id, index)
+end
+
+-- GearSwap injects 0x050 before Windower's equipment table updates. Track those
+-- slots ourselves; the item is already in the bag even when "what is equipped"
+-- is still Fast Cast / idle.
+indi.live = {}
+indi.slot_id = {
+    [0] = 'main',
+    [1] = 'sub',
+    [7] = 'legs',
+    [8] = 'feet',
+    [15] = 'back',
+}
+
+function indi.apply_equip(index, slot_n, bag)
+    local slot = indi.slot_id[slot_n]
+    if not slot then
+        return
+    end
+    if (tonumber(index) or 0) == 0 then
+        indi.live[slot] = nil
+        return
+    end
+    local item = indi.lookup_bag_item(bag, index)
+    if item then
+        indi.live[slot] = item
+    end
+end
+
+function indi.on_equip_packet(id, data)
+    if type(data) ~= 'string' then
+        return
+    end
+    if id == 0x050 then
+        if #data < 7 then
+            return
+        end
+        indi.apply_equip(data:byte(5), data:byte(6), data:byte(7))
+    elseif id == 0x051 then
+        -- GearSwap uses 0x051 when three or more slots change (typical Indi midcast).
+        local n = data:byte(5) or 0
+        if n < 1 then
+            return
+        end
+        for i = 9, 9 + 4 * (n - 1), 4 do
+            if #data >= i + 2 then
+                indi.apply_equip(data:byte(i), data:byte(i + 1), data:byte(i + 2))
+            end
+        end
+    else
+        return
+    end
+    if indi.sampling then
+        indi.sample()
+    end
+end
+
+function indi.fill_missing_from_api()
+    local items = windower.ffxi.get_items()
+    if not items or not items.equipment then
+        return
+    end
+    for i = 1, #indi.slots do
+        local slot = indi.slots[i]
+        if not indi.live[slot] then
+            indi.live[slot] = indi.equipped_item(items, slot)
+        end
+    end
+end
+
+function indi.slot_item(slot, items)
+    if indi.live[slot] then
+        return indi.live[slot]
+    end
+    if items then
+        return indi.equipped_item(items, slot)
+    end
+    return nil
+end
+
+function indi.slot_bonus(item)
+    local name = indi.item_name(item)
+    local name_flat = indi.flat_for_name(name)
+    local desc = indi.item_desc(item)
+    local desc_flat, desc_pct = indi.parse_duration_text(desc)
+    local augs = indi.augments_of(item)
+    local aug_flat, aug_pct = indi.bonus_from_augments(augs)
+    -- +20 is one Nantosuelta path. Only drop it when augments decoded with no duration.
+    if name and name:lower():find('nantosuelta', 1, true)
+        and type(augs) == 'table'
+        and desc_flat == 0 and aug_flat == 0 and desc_pct == 0 and aug_pct == 0 then
+        name_flat = 0
+    end
+    local flat = name_flat
+    if desc_flat > flat then
+        flat = desc_flat
+    end
+    if aug_flat > flat then
+        flat = aug_flat
+    end
+    local pct = desc_pct
+    if aug_pct > pct then
+        pct = aug_pct
+    end
+    -- Lifestream is 10–20% and Gada is 1–11%. Read the augment; never assume max.
+    if name then
+        local low = name:lower()
+        if low:find('lifestream', 1, true) then
+            if pct > 20 then
+                pct = 20
+            end
+        elseif low:find('gada', 1, true) then
+            if pct > 11 then
+                pct = 11
+            end
+        end
+    end
+    return flat, pct
+end
+
+function indi.read_worn()
+    local items = windower.ffxi.get_items()
+    local flat, pct, seen = 0, 0, false
+    local names = {}
+    for i = 1, #indi.slots do
+        local slot = indi.slots[i]
+        local item = indi.slot_item(slot, items)
+        if item then
+            seen = true
+            local add_flat, add_pct = indi.slot_bonus(item)
+            flat = flat + add_flat
+            pct = pct + add_pct
+            local name = indi.item_name(item)
+            if name and (add_flat > 0 or add_pct > 0) then
+                names[#names + 1] = name
+            end
+        end
+    end
+    if pct > 100 then
+        pct = 100
+    end
+    if not seen then
+        return nil
+    end
+    return flat, pct, names
+end
+
+function indi.begin_sample()
+    indi.sampling = os.clock() + 12
+    indi.worn_best = -1
+    indi.worn_flat = nil
+    indi.worn_pct = nil
+    indi.worn_names = nil
+    indi.fill_missing_from_api()
+    indi.sample()
+end
+
+function indi.push_timer()
+    if not indi.landed_at or not indi.land_id then
+        return
+    end
+    local when = indi.landed_at + indi.duration()
+    for i = 1, #entrusted do
+        if entrusted[i].id == indi.land_id then
+            entrusted[i].expires = when
+            return
+        end
+    end
+end
+
+function indi.sample()
+    if not indi.sampling then
+        return
+    end
+    if os.clock() > indi.sampling then
+        indi.sampling = nil
+        return
+    end
+    local flat, pct, names = indi.read_worn()
+    if not flat then
+        return
+    end
+    local jp = indi.clamp(settings.entrust_jp, 0, indi.jp_max, indi.jp_max)
+    local dur = (indi.base + flat + jp) * (1 + pct / 100) + indi.delay
+    if dur > indi.worn_best then
+        indi.worn_best = dur
+        indi.worn_flat = flat
+        indi.worn_pct = pct
+        indi.worn_names = names
+        indi.push_timer()
+    end
+end
+
+function indi.duration()
+    local flat, pct
+    if indi.worn_best >= 0 then
+        flat = indi.worn_flat or 0
+        pct = indi.worn_pct or 0
+    else
+        flat = 0
+        pct = 0
+    end
+    local jp = indi.clamp(settings.entrust_jp, 0, indi.jp_max, indi.jp_max)
+    return (indi.base + flat + jp) * (1 + pct / 100) + indi.delay
+end
+
+function indi.say(message)
+    windower.add_to_chat(207, 'GEO-HUD: ' .. message)
+end
+
+function indi.report()
+    local jp = indi.clamp(settings.entrust_jp, 0, indi.jp_max, indi.jp_max)
+    indi.fill_missing_from_api()
+    local now_flat, now_pct, now_names = indi.read_worn()
+    if now_flat then
+        indi.say(('Currently on: %d flat, %d%% (%s)'):format(
+            now_flat, now_pct, (#now_names > 0 and table.concat(now_names, ', ') or 'no duration pieces')))
+    else
+        indi.say('Currently on: could not read club/legs/feet/back.')
+    end
+    if indi.worn_best >= 0 then
+        local seen = indi.worn_names and #indi.worn_names > 0 and table.concat(indi.worn_names, ', ') or 'none'
+        indi.say(('Last Entrust gear: %d flat, %d%% + %d JP = %.0fs (%s)'):format(
+            indi.worn_flat or 0, indi.worn_pct or 0, jp, indi.worn_best, seen))
+    else
+        indi.say(('No Entrust sample yet. JP=%d (180+%d=%.0fs if the read fails).'):format(
+            jp, jp, indi.base + jp + indi.delay))
+    end
+end
+
 local party_colure = {} -- [player_id] = true if Colure Active from 0x076
 local party_widened = {} -- [player_id] = true if Widened Compass from 0x076
 local party_slot_ids = {} -- [player_id] = true if present in last 0x076
 local saw_party_buffs = false
+-- Widened Compass doubles a spell only if it was *cast* while the JA was up.
+-- The extra range lasts until that luopan / Indi / Entrust wears, not until the JA does.
+-- https://www.bg-wiki.com/ffxi/Widened_Compass
+local widen = {
+    luopan = false,
+    indi = false,
+    indi_from_start = false,
+    pending_luopan = nil,
+    pending_luopan_at = 0,
+    pending_entrust = {},
+}
 local last_geo_id = nil
 local last_luopan_id = nil
 local bubble_hpp = 0
@@ -404,6 +869,12 @@ function chant.enabled()
     return settings.cardinal_chant and chant.main_geo() and not chant.in_town()
 end
 
+function profile.rings_wanted()
+    return settings.rings or settings.range_rings or settings.cardinal_chant
+end
+
+local range_rings = {}
+
 local addon_dir = windower.addon_path:gsub('\\', '/'):gsub('/+$', '') .. '/'
 package.cpath = addon_dir .. 'libs/?.dll;' .. package.cpath
 
@@ -424,12 +895,10 @@ local function open_ring_dll(filename, init)
 end
 
 local rings_loaded_from = nil
--- _GEORings36 is the first build that draws through the shared SceneHook. There is
--- deliberately no fallback to _GEORings35: that build patches draw_scene itself
--- and would fight the bus for the same nine bytes.
-local rings_ok, rings_load_error = open_ring_dll('_GEORings36.dll', 'luaopen__GEORings36')
+-- _GEORings46 draws tag rings, Cardinal Chant, and thin bubble range rings.
+local rings_ok, rings_load_error = open_ring_dll('_GEORings46.dll', 'luaopen__GEORings46')
 if rings_ok then
-    rings_loaded_from = '_GEORings36.dll'
+    rings_loaded_from = '_GEORings46.dll'
 end
 
 local function rings_available()
@@ -689,14 +1158,90 @@ local function has_buff(id)
     return false
 end
 
-local function current_radius()
+function widen.caster_has(actor_id)
+    local player = windower.ffxi.get_player()
+    local me = windower.ffxi.get_mob_by_target('me')
+    local my_id = (me and me.id) or (player and player.id)
+    if not actor_id or actor_id == my_id then
+        return has_buff(C.widened)
+    end
+    return party_widened[actor_id] == true
+end
+
+function widen.radius(active)
     local radius = tonumber(settings.radius) or C.radius
-    if has_buff(C.widened) then
-        radius = radius * 2
-    elseif last_geo_id and party_widened[last_geo_id] then
-        radius = radius * 2
+    if active then
+        return radius * 2
     end
     return radius
+end
+
+-- Luopan in-range checks. Indi / Entrust use widen.radius on their own flags.
+local function current_radius()
+    return widen.radius(widen.luopan)
+end
+
+function widen.clear_luopan()
+    widen.luopan = false
+    widen.pending_luopan = nil
+end
+
+function widen.clear_indi()
+    widen.indi = false
+    widen.indi_from_start = false
+end
+
+function widen.reset()
+    widen.clear_luopan()
+    widen.clear_indi()
+    widen.pending_entrust = {}
+end
+
+function widen.mark_luopan_start(actor_id)
+    widen.pending_luopan = widen.caster_has(actor_id)
+    widen.pending_luopan_at = os.clock()
+end
+
+function widen.commit_luopan(actor_id)
+    local fresh = (os.clock() - (widen.pending_luopan_at or 0)) < 8
+    if widen.pending_luopan ~= nil and fresh then
+        widen.luopan = widen.pending_luopan
+    else
+        widen.luopan = widen.caster_has(actor_id)
+    end
+    return widen.luopan
+end
+
+function widen.mark_indi_start(actor_id)
+    widen.indi = widen.caster_has(actor_id)
+    widen.indi_from_start = true
+    return widen.indi
+end
+
+function widen.commit_indi(actor_id)
+    if not widen.indi_from_start then
+        widen.indi = widen.caster_has(actor_id)
+    end
+    return widen.indi
+end
+
+function widen.mark_entrust_start(actor_id, target_id)
+    if not target_id then
+        return widen.caster_has(actor_id)
+    end
+    widen.pending_entrust[target_id] = {
+        on = widen.caster_has(actor_id),
+        at = os.clock(),
+    }
+    return widen.pending_entrust[target_id].on
+end
+
+function widen.commit_entrust(actor_id, target_id)
+    local pending = target_id and widen.pending_entrust[target_id]
+    if pending and (os.clock() - (pending.at or 0)) < 8 then
+        return pending.on
+    end
+    return widen.caster_has(actor_id)
 end
 
 local function is_luopan(mob)
@@ -909,21 +1454,7 @@ local function party_member_name(id)
     return mob and mob.name
 end
 
-local function ally_in_party(id)
-    if not id then return false end
-    if party_slot_ids[id] then return true end
-    local party = windower.ffxi.get_party()
-    if not party then return false end
-    for i = 1, 5 do
-        local p = party['p' .. i]
-        if p and p.mob and p.mob.id == id then
-            return true
-        end
-    end
-    return false
-end
-
-local function note_entrust(spell_id, target_id)
+local function note_entrust(spell_id, target_id, ours, timed, widened)
     if not spell_id or not target_id or not spells.indi[spell_id] then return end
     local player = windower.ffxi.get_player()
     local me = windower.ffxi.get_mob_by_target('me')
@@ -931,12 +1462,24 @@ local function note_entrust(spell_id, target_id)
     if my_id and target_id == my_id then return end
 
     local name = party_member_name(target_id) or '?'
+    local mob = windower.ffxi.get_mob_by_id(target_id)
+    local npc = mob and mob.is_npc == true
+    local now = os.clock()
+    -- Timer starts when the spell lands (timed), not when Fast Cast starts.
+    local expires = (ours and timed) and (now + indi.duration()) or nil
     for i = 1, #entrusted do
         if entrusted[i].id == target_id then
             entrusted[i].name = name
             entrusted[i].spell = spells.indi[spell_id]
             entrusted[i].element = spells.indi_el[spell_id]
-            entrusted[i].cast = os.clock()
+            entrusted[i].cast = now
+            if timed or not ours then
+                entrusted[i].expires = expires
+            end
+            if not timed or entrusted[i].widened == nil then
+                entrusted[i].widened = widened == true
+            end
+            entrusted[i].npc = npc
             last_hud = ''
             return
         end
@@ -949,7 +1492,10 @@ local function note_entrust(spell_id, target_id)
         name = name,
         spell = spells.indi[spell_id],
         element = spells.indi_el[spell_id],
-        cast = os.clock(),
+        cast = now,
+        expires = expires,
+        npc = npc,
+        widened = widened == true,
     }
     last_hud = ''
 end
@@ -960,8 +1506,23 @@ local function refresh_entrusts()
     local kept = {}
     for i = 1, #entrusted do
         local e = entrusted[i]
-        local pending = (now - (e.cast or 0)) < 2.5
-        local still_up = pending or (not saw_party_buffs) or (party_slot_ids[e.id] and party_colure[e.id])
+        -- No timer until the spell lands; keep the line up through a 4s un-FC cast.
+        local pending = (now - (e.cast or 0)) < (e.expires and 2.5 or 8)
+        local still_up = pending
+        if not still_up then
+            if e.expires then
+                -- We cast this: timer always ends it. Trusts ignore 0x076 Colure.
+                if now < e.expires and indi.party_has(e.id, e.name) then
+                    if e.npc then
+                        still_up = true
+                    else
+                        still_up = (not saw_party_buffs) or (party_slot_ids[e.id] and party_colure[e.id])
+                    end
+                end
+            else
+                still_up = (not saw_party_buffs) or (party_slot_ids[e.id] and party_colure[e.id])
+            end
+        end
         if still_up then
             local name = party_member_name(e.id)
             if name then e.name = name end
@@ -999,6 +1560,7 @@ local function refresh_indi()
     last_indi = nil
     last_indi_element = nil
     last_indi_status = nil
+    widen.clear_indi()
 end
 
 local function actor_id_is_me(actor_id)
@@ -1046,17 +1608,37 @@ local function note_indi_from_action(act)
     end
 
     local tid = action_target_id(act)
+    local starting = act.category == 8
     if tid then
         if my_id and ours and tid ~= my_id then
-            note_entrust(act.param, tid)
+            if starting then
+                indi.land_id = tid
+                indi.landed_at = nil
+                indi.begin_sample()
+                note_entrust(act.param, tid, true, false, widen.mark_entrust_start(actor, tid))
+                return
+            end
+            -- Spell landing is aftercast idle. Keep sampling a moment so late
+            -- GearSwap midcast 0x050s can still raise the timer; MAX ignores idle.
+            indi.land_id = tid
+            indi.landed_at = os.clock()
+            note_entrust(act.param, tid, true, true, widen.commit_entrust(actor, tid))
+            indi.sampling = os.clock() + 0.6
+            indi.sample()
             return
         end
         if not ours and tid ~= actor then
-            note_entrust(act.param, tid)
+            local widened = starting and widen.mark_entrust_start(actor, tid) or widen.commit_entrust(actor, tid)
+            note_entrust(act.param, tid, false, nil, widened)
             return
         end
     elseif ours and has_buff(C.entrust) then
         return
+    end
+    if starting then
+        widen.mark_indi_start(actor)
+    else
+        widen.commit_indi(actor)
     end
     note_self_indi(act.param)
 end
@@ -1128,6 +1710,18 @@ local function resolve_bubble()
 end
 
 -- ── enmity tags ────────────────────────────────────────────────────────────
+
+function C.auto_tagged()
+    local info = windower.ffxi.get_info()
+    return info ~= nil and C.auto_tag_zones[tonumber(info.zone) or 0] == true
+end
+
+function C.mob_tagged(id)
+    if C.auto_tagged() then
+        return true
+    end
+    return id ~= nil and tagged[id] ~= nil
+end
 
 local function tag_mob(id)
     if not id or id == 0 then return end
@@ -1269,12 +1863,18 @@ local function apply_action_tags(act, geo_id)
     record_party_hate(act)
 
     -- Anyone finishing a Geo- spell is the Geomancer we should watch.
-    -- Geo- itself does not put surrounding enemies on the enmity list.
+    -- A debuff Geo- generates enmity on the targeted mob. It does not put
+    -- other enemies that later walk into the bubble on the hate list.
+    local is_geo_start = act.category == 8 and act.param and spells.geo[act.param]
     local is_geo_spell = act.category == 4 and act.param and spells.geo[act.param]
+    if is_geo_start then
+        widen.mark_luopan_start(act.actor_id)
+    end
     if is_geo_spell then
         remember_geo_spell(act.param, spells.geo[act.param])
         last_geo_id = act.actor_id
         geo_id = act.actor_id
+        widen.commit_luopan(act.actor_id)
     end
 
     note_indi_from_action(act)
@@ -1289,9 +1889,23 @@ local function apply_action_tags(act, geo_id)
             bubble_alive = false
             bubble_hpp = 0
             last_luopan_id = nil
+            widen.clear_luopan()
         end
 
-        if is_geo_spell then return end
+        if is_geo_spell then
+            if colure_effect(spells.geo[act.param]) ~= true and act.targets then
+                for i = 1, act.target_count or #act.targets do
+                    local target = act.targets[i]
+                    if target and target.id then
+                        local mob = windower.ffxi.get_mob_by_id(target.id)
+                        if mob and is_enemy(mob) then
+                            tag_mob(target.id)
+                        end
+                    end
+                end
+            end
+            return
+        end
         if not act.targets then return end
 
         local is_cure = act.category == 4 and act.param and spells.cure[act.param]
@@ -1485,11 +2099,11 @@ local function scan_nearby(me, luopan)
     end
     table.sort(found, function(a, b)
         local ra = current_radius()
-        local a_tag = tagged[a.id] and 1 or 0
-        local b_tag = tagged[b.id] and 1 or 0
+        local a_tag = C.mob_tagged(a.id) and 1 or 0
+        local b_tag = C.mob_tagged(b.id) and 1 or 0
         local a_in = dist3(origin, a) <= ra and 1 or 0
         local b_in = dist3(origin, b) <= ra and 1 or 0
-        -- Un-tagged in-range first (still need a hit), then tagged in-range, then the rest.
+        -- Un-tagged in-range first (still need hate), then tagged in-range, then the rest.
         local a_need = (a_in == 1 and a_tag == 0) and 0 or 1
         local b_need = (b_in == 1 and b_tag == 0) and 0 or 1
         if a_need ~= b_need then return a_need < b_need end
@@ -1794,6 +2408,10 @@ local function update_hud(luopan, geo_id, we_are_geo)
                 in_range = in_range + 1
             end
         end
+        if C.auto_tagged() then
+            tagged_in = in_range
+            tagged_total = math.max(tagged_total, in_range)
+        end
         potency = (not bubble_alive and 'no bubble')
             or (in_range == 0 and 'no enemies in range')
             or ('%d/%d in range tagged'):format(tagged_in, in_range)
@@ -1842,7 +2460,11 @@ local function update_hud(luopan, geo_id, we_are_geo)
         local name = e.name or '?'
         if #name > 12 then name = name:sub(1, 11) .. '.' end
         local spell = e.spell or 'Indi- ???'
-        lines[#lines + 1] = cs(120, 255, 140, 'ENTRUST') .. '  ' .. cs(240, 255, 255, spell .. '  ' .. name)
+        local line = spell .. '  ' .. name
+        if e.expires then
+            line = line .. '  ' .. indi.clock(e.expires - os.clock())
+        end
+        lines[#lines + 1] = cs(120, 255, 140, 'ENTRUST') .. '  ' .. cs(240, 255, 255, line)
         if i < #entrusted then
             lines[#lines + 1] = ''
             lines[#lines + 1] = ''
@@ -1864,7 +2486,7 @@ local function update_hud(luopan, geo_id, we_are_geo)
             local mob = windower.ffxi.get_mob_by_id(nearby_ids[i])
             if mob then
                 local d = luopan and dist3(luopan, mob) or dist3(windower.ffxi.get_mob_by_target('me'), mob)
-                local is_tagged = tagged[mob.id] ~= nil
+                local is_tagged = C.mob_tagged(mob.id)
                 local in_b = luopan and d <= radius + 0.15
                 local mark, status, rgb
                 if is_tagged and in_b then
@@ -1927,25 +2549,29 @@ local function send_ipc(luopan, geo_id)
     end
     table.sort(ids)
     local enc = {}
+    local enc_w = {}
     for i = 1, #entrusted do
         local e = entrusted[i]
         local name = (e.name or '?'):gsub('[~;|]', '')
         enc[#enc + 1] = ('%s~%s~%s~%s'):format(tostring(e.id or 0), e.spell or '', tostring(e.element or ''), name)
+        enc_w[#enc_w + 1] = e.widened and '1' or '0'
     end
     local payload = table.concat({
         'GH',
-        '2',
+        '3',
         player.name,
         tostring(info.zone or 0),
         tostring(geo_id or 0),
         tostring(luopan and luopan.id or 0),
         tostring(bubble_hpp or 0),
         tostring(last_spell or ''),
-        ('%.1f'):format(current_radius()),
+        widen.luopan and '1' or '0',
         table.concat(ids, ','),
         tostring(last_indi or ''),
         tostring(last_indi_element or ''),
         table.concat(enc, ';'),
+        widen.indi and '1' or '0',
+        table.concat(enc_w, ','),
     }, '|')
 
     local now = os.clock()
@@ -1986,6 +2612,10 @@ local function on_ipc(msg)
         end
     end
     if not watching_own_indi() then
+        if parts[2] == '3' then
+            widen.luopan = parts[9] == '1'
+            widen.indi = parts[14] == '1'
+        end
         if parts[11] and parts[11] ~= '' then
             last_indi = parts[11]
             last_indi_element = tonumber(parts[12])
@@ -1994,15 +2624,23 @@ local function on_ipc(msg)
         end
         if parts[13] and parts[13] ~= '' then
             local rebuilt = {}
+            local flags = {}
+            if parts[15] then
+                for bitflag in parts[15]:gmatch('[^,]+') do
+                    flags[#flags + 1] = bitflag == '1'
+                end
+            end
             for token in parts[13]:gmatch('[^;]+') do
                 local id, spell, elem, name = token:match('^(%d+)~([^~]*)~([^~]*)~(.*)$')
                 if id then
-                    rebuilt[#rebuilt + 1] = {
+                    local n = #rebuilt + 1
+                    rebuilt[n] = {
                         id = tonumber(id),
                         spell = spell ~= '' and spell or 'Indi- ???',
                         element = tonumber(elem),
                         name = name ~= '' and name or '?',
                         cast = os.clock(),
+                        widened = flags[n] == true,
                     }
                 end
             end
@@ -2032,6 +2670,7 @@ local function reset_zone()
     nearby_ids = {}
     last_hud = ''
     last_ipc_payload = ''
+    widen.reset()
     hud:hide()
     hide_orb()
     hide_indi_orb()
@@ -2104,6 +2743,12 @@ local function stop_rings()
         _GEORings.clear()
         if _GEORings.commit then
             _GEORings.commit()
+        end
+        if _GEORings.range_clear then
+            _GEORings.range_clear()
+        end
+        if _GEORings.range_commit then
+            _GEORings.range_commit()
         end
         _GEORings.stop()
     end
@@ -2237,6 +2882,7 @@ function chant.submit()
     end
 
     start_rings()
+    range_rings.note_player()
     _GEORings.chant(
         tonumber(me.index) or 0,
         tonumber(me.x) or 0,
@@ -2244,6 +2890,96 @@ function chant.submit()
         tonumber(me.z) or 0,
         chant.radius,
         chant.color_for(east, north))
+end
+
+function range_rings.note_player()
+    if not rings_available() or not _GEORings.player then
+        return
+    end
+    local me = windower.ffxi.get_mob_by_target('me')
+    if me and (tonumber(me.index) or 0) ~= 0 then
+        _GEORings.player(me.index, tonumber(me.x) or 0, tonumber(me.y) or 0, tonumber(me.z) or 0)
+    else
+        _GEORings.player(0, 0, 0, 0)
+    end
+end
+
+function range_rings.publish()
+    if rings_available() and _GEORings.range_commit then
+        _GEORings.range_commit()
+    end
+end
+
+function range_rings.clear()
+    if not rings_available() or not _GEORings.range_clear then
+        return
+    end
+    _GEORings.range_clear()
+    range_rings.publish()
+end
+
+function range_rings.color_for(element)
+    local folder = ELEMENT_FOLDER[tonumber(element)] or 'Light'
+    local rgb = ELEMENT_RGB[folder] or ELEMENT_RGB.Light
+    return chant.pack(rgb[1], rgb[2], rgb[3], 255)
+end
+
+function range_rings.add(mob, radius, element)
+    if not mob or not _GEORings.range_add then
+        return
+    end
+    local index = tonumber(mob.index) or 0
+    if index == 0 or not radius or radius <= 0 then
+        return
+    end
+    _GEORings.range_add(
+        index,
+        tonumber(mob.x) or 0,
+        tonumber(mob.y) or 0,
+        tonumber(mob.z) or 0,
+        radius,
+        range_rings.color_for(element))
+end
+
+function range_rings.indi_hub()
+    if watching_own_indi() then
+        return windower.ffxi.get_mob_by_target('me')
+    end
+    if last_geo_id then
+        return windower.ffxi.get_mob_by_id(last_geo_id)
+    end
+    return nil
+end
+
+function range_rings.submit(luopan)
+    if not rings_available() or not _GEORings.range_clear then
+        return
+    end
+    if hidden or not settings.range_rings then
+        range_rings.clear()
+        return
+    end
+
+    start_rings()
+    range_rings.note_player()
+    _GEORings.range_clear()
+    if luopan == nil then
+        luopan = select(1, resolve_bubble())
+    end
+    range_rings.add(luopan, current_radius(), last_spell_element)
+
+    if last_indi or watched_geo_has_colure() then
+        range_rings.add(range_rings.indi_hub(), widen.radius(widen.indi), last_indi_element)
+    end
+
+    for i = 1, #entrusted do
+        local e = entrusted[i]
+        if e and e.id then
+            range_rings.add(windower.ffxi.get_mob_by_id(e.id), widen.radius(e.widened), e.element)
+        end
+    end
+
+    range_rings.publish()
 end
 
 function profile.apply_visuals()
@@ -2257,13 +2993,16 @@ function profile.apply_visuals()
         hide_hp_bar()
         hide_hud_panel()
     end
-    if not hidden and (settings.rings or chant.enabled()) then
+    if not hidden and profile.rings_wanted() then
         start_rings()
         if not settings.rings and rings_available() then
             _GEORings.clear()
             if _GEORings.commit then
                 _GEORings.commit()
             end
+        end
+        if not settings.range_rings then
+            range_rings.clear()
         end
     else
         stop_rings()
@@ -2305,7 +3044,7 @@ local function is_ring_mob(mob, known)
         return false
     end
     if known then
-        if tagged[mob.id] then
+        if C.mob_tagged(mob.id) then
             return true
         end
         return not is_dead_mob(mob)
@@ -2363,35 +3102,40 @@ local function submit_rings(luopan)
     end
     local radius = current_radius()
 
+    -- Rings only exist while a luopan does. Keep hate tags for the next bubble.
+    if not luopan then
+        ring_inside = {}
+        publish_rings()
+        return
+    end
+
     if bubble_is_buff() then
         local still_inside = {}
         local candidates = {}
-        if luopan then
-            for _, mob in ipairs(party_member_mobs()) do
-                if not is_luopan(mob) and not is_dead_mob(mob) then
-                    local dist = dist3(luopan, mob)
-                    local was_inside = ring_inside[mob.id]
-                    local in_bubble
-                    if was_inside then
-                        in_bubble = dist <= radius + 0.70
-                    else
-                        in_bubble = dist <= radius + 0.15
-                    end
-                    if in_bubble then
-                        still_inside[mob.id] = true
-                        candidates[#candidates + 1] = {id = mob.id, mob = mob, dist = dist}
-                    end
+        for _, mob in ipairs(party_member_mobs()) do
+            if not is_luopan(mob) and not is_dead_mob(mob) then
+                local dist = dist3(luopan, mob)
+                local was_inside = ring_inside[mob.id]
+                local in_bubble
+                if was_inside then
+                    in_bubble = dist <= radius + 0.70
+                else
+                    in_bubble = dist <= radius + 0.15
+                end
+                if in_bubble then
+                    still_inside[mob.id] = true
+                    candidates[#candidates + 1] = {id = mob.id, mob = mob, dist = dist}
                 end
             end
-            table.sort(candidates, function(a, b)
-                if a.dist ~= b.dist then
-                    return a.dist < b.dist
-                end
-                return a.id < b.id
-            end)
-            for i = 1, math.min(#candidates, cap) do
-                add_mob(candidates[i].mob, true)
+        end
+        table.sort(candidates, function(a, b)
+            if a.dist ~= b.dist then
+                return a.dist < b.dist
             end
+            return a.id < b.id
+        end)
+        for i = 1, math.min(#candidates, cap) do
+            add_mob(candidates[i].mob, true)
         end
         ring_inside = still_inside
         publish_rings()
@@ -2411,27 +3155,24 @@ local function submit_rings(luopan)
         if not mob or not is_ring_mob(mob, known) then
             return
         end
-        local is_tagged = tagged[id] ~= nil
-        local dist = luopan and dist3(luopan, mob) or 9999
+        local is_tagged = C.mob_tagged(id)
+        local dist = dist3(luopan, mob)
         local was_inside = ring_inside[id]
         local in_bubble
-        if not luopan then
-            in_bubble = false
-        elseif was_inside then
+        if was_inside then
             in_bubble = dist <= radius + 0.70
         else
             in_bubble = dist <= radius + 0.15
         end
-        if not is_tagged and not in_bubble then
+        if not in_bubble then
             return
         end
         seen[id] = true
-        still_inside[id] = in_bubble
+        still_inside[id] = true
         candidates[#candidates + 1] = {
             id = id,
             mob = mob,
-            green = is_tagged and in_bubble,
-            in_bubble = in_bubble and 1 or 0,
+            green = is_tagged,
             dist = dist,
         }
     end
@@ -2446,9 +3187,6 @@ local function submit_rings(luopan)
     ring_inside = still_inside
 
     table.sort(candidates, function(a, b)
-        if a.in_bubble ~= b.in_bubble then
-            return a.in_bubble > b.in_bubble
-        end
         if a.green ~= b.green then
             return a.green and not b.green
         end
@@ -2471,26 +3209,28 @@ local function report_rings()
     else
         chat('Ground rings: native module failed to load.')
         chat(tostring(rings_load_error))
-        chat('Expected addons/GEO-HUD/libs/_GEORings36.dll.')
+        chat('Expected addons/GEO-HUD/libs/_GEORings46.dll.')
     end
     chat('Rings drawing ' .. (settings.rings and 'on' or 'off') .. '  (//geohud rings on|off)')
+    chat('Range rings ' .. (settings.range_rings and 'on' or 'off') .. '  (//geohud rangerings on|off)')
 end
 
 local function print_help()
     chat('Commands:')
     chat('  //geohud show | hide | reset')
-    chat('  //geohud hud on|off       — hide text/orbs, keep ground rings')
-    chat('  //geohud radius <yalms>   — bubble radius (default 6; Widened Compass auto-doubles)')
-    chat('  //geohud ipc on|off       — share tags/Indi/Entrust with other local Windower instances')
-    chat('  //geohud orbs on|off      — luopan / Indi / Entrust bubble animations')
-    chat('  //geohud rings on|off     — debuff: green = tagged in bubble; buff: green = party in bubble')
-    chat('  //geohud cardinalchant on|off — main GEO only, off in towns: N blue crit, E red MAB, S green macc, W yellow MB')
-    chat('  //geohud colorblind on|off — X on red rings, O on green rings')
-    chat('  //geohud rings status     — native ring module hook/device state')
-    chat('  //geohud mobs on|off      — nearby mob list under the HUD (off by default)')
-    chat('  //geohud profile          — show the current character/job settings files')
-    chat('  //geohud save char        — save HUD/rings/orbs toggles for this character (all jobs)')
-    chat('  Drag the HUD to reposition. + tagged (potency on), ! in bubble with no GEO hate.')
+    chat('  //geohud hud on|off       - hide text/orbs, keep ground rings')
+    chat('  //geohud radius <yalms>   - bubble radius (default 6; Widened Compass doubles spells cast while it is up)')
+    chat('  //geohud ipc on|off       - share tags/Indi/Entrust with other local Windower instances')
+    chat('  //geohud orbs on|off      - luopan / Indi / Entrust bubble animations')
+    chat('  //geohud rings on|off     - in bubble only; debuff: green = tagged, red = untagged; buff: green = party')
+    chat('  //geohud rangerings on|off - thin element-coloured floor ring at the bubble edge (luopan, Indi, Entrust)')
+    chat('  //geohud cardinalchant on|off - N blue crit, E red MAB, S green macc, W yellow MB')
+    chat('  //geohud entrustjp [0-40] - Indicolure Duration JP seconds (default 40); gear is read while you cast')
+    chat('  //geohud colorblind on|off - X on red rings, O on green rings')
+    chat('  //geohud rings status     - native ring module hook/device state')
+    chat('  //geohud mobs on|off      - nearby mob list under the HUD (off by default)')
+    chat('  //geohud profile          - show the current character/job settings files')
+    chat('  //geohud save char        - save HUD/rings/orbs toggles for this character (all jobs)')
 end
 
 -- GEO-HUD 1.6 copied BCRings.dll into Windower/plugins. 1.7 draws from the
@@ -2577,7 +3317,7 @@ windower.register_event('load', function()
     hide_hud_panel()
     hide_hp_bar()
     cleanup_legacy_bcrings()
-    if settings.rings or settings.cardinal_chant then
+    if profile.rings_wanted() then
         start_rings()
         if not rings_available() then
             chat('Ground rings failed: ' .. tostring(rings_load_error))
@@ -2604,7 +3344,7 @@ windower.register_event('login', function()
     profile.capture()
     profile.apply()
     profile.apply_visuals()
-    if settings.rings or settings.cardinal_chant then
+    if profile.rings_wanted() then
         start_rings()
     end
 end)
@@ -2624,6 +3364,7 @@ windower.register_event('job change', function()
     last_spell_element = nil
     last_spell_is_buff = false
     last_luopan_id = nil
+    widen.clear_luopan()
     local char, job = profile.who()
     if char == profile.char and job == profile.job then
         return
@@ -2664,6 +3405,16 @@ windower.register_event('lose buff', function(id)
     end
 end)
 
+-- GearSwap injects 0x050 (one slot) or 0x051 (three or more slots). Must not ignore injected.
+windower.register_event('outgoing chunk', function(id, original, modified, injected)
+    if id == 0x050 or id == 0x051 then
+        indi.on_equip_packet(id, original)
+        if modified and modified ~= original then
+            indi.on_equip_packet(id, modified)
+        end
+    end
+end)
+
 windower.register_event('incoming chunk', function(id, original, modified, injected)
     if injected or not logged_in then return end
 
@@ -2683,6 +3434,7 @@ windower.register_event('incoming chunk', function(id, original, modified, injec
                     last_luopan_id = nil
                     bubble_alive = false
                     bubble_hpp = 0
+                    widen.clear_luopan()
                 end
             end
         end
@@ -2704,6 +3456,7 @@ windower.register_event('incoming chunk', function(id, original, modified, injec
             last_luopan_id = nil
             bubble_alive = false
             bubble_hpp = 0
+            widen.clear_luopan()
         elseif packet['Current HP%'] then
             bubble_hpp = packet['Current HP%']
         end
@@ -2738,6 +3491,7 @@ windower.register_event('ipc message', on_ipc)
 
 windower.register_event('prerender', function()
     poll_legacy_plugin_cleanup()
+    indi.sample()
     if not logged_in or hidden then
         hud:hide()
         hide_orb()
@@ -2746,6 +3500,7 @@ windower.register_event('prerender', function()
         hide_hp_bar()
         hide_hud_panel()
         submit_rings()   -- clears rings; not throttled so they disappear immediately
+        range_rings.submit()
         chant.submit()
         return
     end
@@ -2761,6 +3516,7 @@ windower.register_event('prerender', function()
         hide_hp_bar()
         hide_hud_panel()
         submit_rings()   -- clears rings; not throttled so they disappear immediately
+        range_rings.submit()
         chant.submit()
         return
     end
@@ -2791,6 +3547,7 @@ windower.register_event('prerender', function()
         if settings.rings and not hidden then
             submit_rings(luopan)
         end
+        range_rings.submit(luopan)
         chant.submit()
     end
 end)
@@ -2814,12 +3571,15 @@ windower.register_event('addon command', function(command, ...)
         if job_file then
             chat('  Job file: ' .. job_file .. (files.new(job_file):exists() and '' or ' (none yet)'))
         end
-        chat(('  hud=%s  orbs=%s  rings=%s  chant=%s  mobs=%s'):format(
+        chat(('  hud=%s  orbs=%s  rings=%s  range=%s  chant=%s  mobs=%s'):format(
             settings.show_hud ~= false and 'on' or 'off',
             settings.orbs ~= false and 'on' or 'off',
             settings.rings and 'on' or 'off',
+            settings.range_rings and 'on' or 'off',
             settings.cardinal_chant and 'on' or 'off',
             settings.show_mobs and 'on' or 'off'))
+        chat(('  entrust jp=%s'):format(tostring(settings.entrust_jp or indi.jp_max)))
+        indi.report()
     elseif command == 'save' then
         local arg = args[1] and args[1]:lower()
         local char, job = profile.who()
@@ -2847,7 +3607,7 @@ windower.register_event('addon command', function(command, ...)
         else settings.colorblind = not settings.colorblind end
         profile.save()
         apply_colorblind()
-        chat('Colorblind rings ' .. (settings.colorblind and 'on' or 'off') .. '  (O = green, X = red).')
+        chat('Colorblind rings ' .. (settings.colorblind and 'on' or 'off') .. '  (O = green, X = red; chant letters brighter).')
     elseif command == 'hide' then
         hidden = true
         hud:hide()
@@ -2857,6 +3617,7 @@ windower.register_event('addon command', function(command, ...)
         hide_hp_bar()
         hide_hud_panel()
         submit_rings()
+        range_rings.submit()
         chant.submit()
         chat('HUD and rings hidden. //geohud show to restore.')
     elseif command == 'hud' then
@@ -2900,6 +3661,7 @@ windower.register_event('addon command', function(command, ...)
         end
         settings.radius = n
         profile.save()
+        range_rings.submit()
         chat('Bubble radius set to ' .. n .. ' yalms.')
     elseif command == 'rings' or command == 'ring' then
         local arg = args[1] and args[1]:lower()
@@ -2923,14 +3685,14 @@ windower.register_event('addon command', function(command, ...)
             else settings.colorblind = not settings.colorblind end
             profile.save()
             apply_colorblind()
-            chat('Colorblind rings ' .. (settings.colorblind and 'on' or 'off') .. '  (O = green, X = red).')
+            chat('Colorblind rings ' .. (settings.colorblind and 'on' or 'off') .. '  (O = green, X = red; chant letters brighter).')
             return
         end
         if arg == 'on' then settings.rings = true
         elseif arg == 'off' then settings.rings = false
         else settings.rings = not settings.rings end
         profile.save()
-        if settings.rings or settings.cardinal_chant then
+        if profile.rings_wanted() then
             start_rings()
             if settings.rings then
                 submit_rings()
@@ -2938,11 +3700,26 @@ windower.register_event('addon command', function(command, ...)
                 _GEORings.clear()
                 publish_rings()
             end
+            range_rings.submit()
             chant.submit()
         else
             stop_rings()
         end
         chat('Ground rings ' .. (settings.rings and 'on' or 'off') .. '.')
+    elseif command == 'rangerings' or command == 'rangering' or command == 'rr' then
+        local arg = args[1] and args[1]:lower()
+        if arg == 'on' then settings.range_rings = true
+        elseif arg == 'off' then settings.range_rings = false
+        else settings.range_rings = not settings.range_rings end
+        profile.save()
+        if profile.rings_wanted() then
+            start_rings()
+            range_rings.submit()
+        else
+            stop_rings()
+        end
+        chat('Range rings ' .. (settings.range_rings and 'on' or 'off')
+            .. '  (thin element-coloured floor ring at the bubble edge).')
     elseif command == 'cardinalchant' or command == 'cardinal' or command == 'chant' or command == 'cc' then
         local arg = args[1] and args[1]:lower()
         if arg ~= 'off' and not chant.main_geo() then
@@ -2956,7 +3733,7 @@ windower.register_event('addon command', function(command, ...)
         elseif arg == 'off' then settings.cardinal_chant = false
         else settings.cardinal_chant = not settings.cardinal_chant end
         profile.save()
-        if settings.rings or chant.enabled() then
+        if profile.rings_wanted() then
             start_rings()
             chant.submit()
         else
@@ -2964,6 +3741,28 @@ windower.register_event('addon command', function(command, ...)
         end
         chat('Cardinal Chant circle ' .. (settings.cardinal_chant and 'on' or 'off')
             .. '  (N blue crit, E red MAB, S green macc, W yellow MB).')
+    elseif command == 'entrustdur' or command == 'indidur' or command == 'entrustduration' or command == 'entrustjp' then
+        local a = tonumber(args[1])
+        local b = tonumber(args[2])
+        local c = tonumber(args[3])
+        if b then
+            chat('Duration gear is read from what you wear during the Entrust Indi. Do not add pants, cape, or Gada by hand.')
+            if c then
+                settings.entrust_jp = indi.clamp(c, 0, indi.jp_max, indi.jp_max)
+                profile.save()
+                chat(('Indicolure Duration JP set to %d.'):format(settings.entrust_jp))
+            else
+                chat('Only job points are set by hand: //geohud entrustjp <0-40>  (default 40).')
+            end
+            indi.report()
+            return
+        end
+        if a then
+            settings.entrust_jp = indi.clamp(a, 0, indi.jp_max, indi.jp_max)
+            profile.save()
+            chat(('Indicolure Duration JP set to %d.'):format(settings.entrust_jp))
+        end
+        indi.report()
     elseif command == 'ipc' then
         local arg = args[1] and args[1]:lower()
         if arg == 'on' then settings.ipc = true

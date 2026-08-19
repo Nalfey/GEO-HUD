@@ -1,4 +1,4 @@
-LIBRARY "_GEORings36.dll"
+LIBRARY "_GEORings46.dll"
 EXPORTS
     luaopen_geohud_rings
     luaopen_geohud_rings2
@@ -17,4 +17,14 @@ EXPORTS
     luaopen__GEORings34
     luaopen__GEORings35
     luaopen__GEORings36
+    luaopen__GEORings37
+    luaopen__GEORings38
+    luaopen__GEORings39
+    luaopen__GEORings40
+    luaopen__GEORings41
+    luaopen__GEORings42
+    luaopen__GEORings43
+    luaopen__GEORings44
+    luaopen__GEORings45
+    luaopen__GEORings46
     luaopen__GEORings_new

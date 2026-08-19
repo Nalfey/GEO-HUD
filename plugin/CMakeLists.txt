@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(GEORings
-    VERSION 2.0.0
+    VERSION 2.0.2
     LANGUAGES CXX
 )
 
@@ -16,7 +16,7 @@ target_include_directories(_GEORings PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../Sce
 
 set_target_properties(_GEORings PROPERTIES
     PREFIX ""
-    OUTPUT_NAME "_GEORings36"
+    OUTPUT_NAME "_GEORings46"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../libs"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../libs"
 )
