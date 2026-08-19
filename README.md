@@ -15,7 +15,7 @@ Copy the **GEO-HUD** folder into `Windower4/addons/` so you have:
 
 ```
 Windower4/addons/GEO-HUD/GEO-HUD.lua
-Windower4/addons/GEO-HUD/libs/_GEORings35.dll
+Windower4/addons/GEO-HUD/libs/_GEORings36.dll
 Windower4/addons/GEO-HUD/assets/...
 ```
 
@@ -25,17 +25,24 @@ Then in game:
 //lua load GEO-HUD
 ```
 
-Ground rings are drawn by `libs/_GEORings35.dll`, loaded from the addon folder. Nothing goes in `Windower4/plugins/`.
+Ground rings are drawn by `libs/_GEORings36.dll`, loaded from the addon folder. Nothing goes in `Windower4/plugins/`.
 
 If you previously used GEO-HUD 1.4, this version unloads `BCRings` and deletes `Windower4/plugins/BCRings.dll` on load so the old plugin cannot double-draw. You can also remove `load BCRings` from `init.txt` if it is still there.
 
-GEO-HUD and TargetRing can run together. GEO-HUD finds `draw_scene` even after TargetRing has jumped it, becomes the outer hook, then calls TargetRing and draws. If TargetRing is unloaded, GEO-HUD keeps the original scene trampoline so the game does not crash.
+GEO-HUD and TargetRing can run together, in any load order, and either one can be unloaded or reloaded at any time. Neither addon hooks the other any more: both draw through a shared scene hook that owns the single `draw_scene` patch for the whole process. Use TargetRing 3.0.0 or later with this build. See [SceneHook/SceneHook.md](SceneHook/SceneHook.md) if you want the details, or if you are writing an addon that needs to draw in the 3D scene yourself.
+
+If you still have GEO-HUD 1.9.x or TargetRing 2.x loaded in this client session, restart FFXI once. Those builds patch `draw_scene` themselves, and SceneHook will not find the original prologue until the process is fresh.
 
 ## Special Thanks
 
 Special thanks to Broguypal for sharing his [TargetRing](https://github.com/Broguypal/Addons/tree/main/TargetRing) code.
 
 
+
+### v2.0.0
+* Rewritten hook handling. GEO-HUD and TargetRing no longer patch or chain into each other; both register with a shared scene hook. Load order, unload order and reloading no longer matter, and neither addon can crash the other.
+
+* The ring DLL is now `_GEORings36.dll`. There is deliberately no fallback to `_GEORings35.dll`, which patches `draw_scene` on its own and would fight the bus. Update TargetRing to 3.0.0 at the same time if you use it.
 
 ### v1.9.5
 * Do not free the draw_scene trampoline if another addon chained on top of GEO-HUD, so unloading GEO-HUD after TargetRing no longer crashes.

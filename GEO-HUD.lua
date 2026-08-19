@@ -28,7 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 _addon.name = 'GEO-HUD'
 _addon.author = 'Nalfey'
-_addon.version = '1.9.5'
+_addon.version = '2.0.0'
 _addon.commands = {'geohud', 'gh'}
 
 require('tables')
@@ -424,9 +424,12 @@ local function open_ring_dll(filename, init)
 end
 
 local rings_loaded_from = nil
-local rings_ok, rings_load_error = open_ring_dll('_GEORings35.dll', 'luaopen__GEORings35')
+-- _GEORings36 is the first build that draws through the shared SceneHook. There is
+-- deliberately no fallback to _GEORings35: that build patches draw_scene itself
+-- and would fight the bus for the same nine bytes.
+local rings_ok, rings_load_error = open_ring_dll('_GEORings36.dll', 'luaopen__GEORings36')
 if rings_ok then
-    rings_loaded_from = '_GEORings35.dll'
+    rings_loaded_from = '_GEORings36.dll'
 end
 
 local function rings_available()
@@ -2468,7 +2471,7 @@ local function report_rings()
     else
         chat('Ground rings: native module failed to load.')
         chat(tostring(rings_load_error))
-        chat('Expected addons/GEO-HUD/libs/_GEORings35.dll.')
+        chat('Expected addons/GEO-HUD/libs/_GEORings36.dll.')
     end
     chat('Rings drawing ' .. (settings.rings and 'on' or 'off') .. '  (//geohud rings on|off)')
 end

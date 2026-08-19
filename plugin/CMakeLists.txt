@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(GEORings
-    VERSION 1.7.0
+    VERSION 2.0.0
     LANGUAGES CXX
 )
 
@@ -10,9 +10,13 @@ add_library(_GEORings SHARED
     exports.def
 )
 
+# SceneHook.h must be byte-identical to the copy every other participant
+# builds against.
+target_include_directories(_GEORings PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../SceneHook")
+
 set_target_properties(_GEORings PROPERTIES
     PREFIX ""
-    OUTPUT_NAME "_GEORings35"
+    OUTPUT_NAME "_GEORings36"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../libs"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../libs"
 )

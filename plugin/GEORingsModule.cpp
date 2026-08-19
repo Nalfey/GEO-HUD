@@ -2,6 +2,8 @@
 #include <windows.h>
 #include <d3d8.h>
 
+#include "SceneHook.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -90,10 +92,6 @@ constexpr DWORD kMaxIndex = 0x900;
 constexpr std::uintptr_t kEntityDisplayPos = 0x004;
 constexpr std::uintptr_t kEntityDisplayPtr = 0x0A0;
 constexpr std::uintptr_t kDisplayNameplateBase = 0x678;
-constexpr std::size_t kPrologueBytes = 9;
-constexpr unsigned char kDrawScenePrologue[kPrologueBytes] = {
-    0x56, 0x8B, 0xF1, 0x8B, 0x86, 0x50, 0x0D, 0x00, 0x00,
-};
 
 bool page_executable(DWORD protect);
 
@@ -129,17 +127,13 @@ struct CompassMark {
 };
 CompassMark g_compass[4] {}; // N, E, S, W screen positions from last draw
 
-using draw_scene_fn = void(__fastcall*)(void*, void*);
-draw_scene_fn g_trampoline = nullptr;
-draw_scene_fn g_previous_hook = nullptr;
-std::uintptr_t g_draw_scene = 0;
-unsigned char g_replaced_bytes[kPrologueBytes] {};
-void* g_trampoline_mem = nullptr;
+// The scene hook owns the draw_scene patch; this module only registers a
+// callback with it. See ../SceneHook/SceneHook.md.
+SceneBus* g_bus = nullptr;
+int g_bus_slot = -1;
 volatile bool g_hooked = false;
 volatile unsigned long g_frames = 0;
 volatile unsigned long g_draws = 0;
-unsigned long g_last_seen_frames = 0;
-DWORD g_inner_ok_ms = 0;
 std::uintptr_t g_renderer = 0;
 std::uintptr_t g_device = 0;
 volatile bool g_discovery_done = false;
@@ -148,14 +142,7 @@ constexpr std::size_t kRendererScanWindow = 0x8000;
 constexpr std::size_t kDeviceVtableEntries = 90;
 constexpr unsigned long kDeviceRetryFrames = 30;
 constexpr unsigned long kMaxDeviceAttempts = 240;
-using fn_end_scene = long(__stdcall*)(void*);
-constexpr int kEndSceneSlot = 35;
-fn_end_scene g_orig_end_scene = nullptr;
-void** g_end_scene_slot = nullptr;
-bool g_end_scene_hooked = false;
 char g_status[192] = "idle";
-DWORD g_next_find_ms = 0;
-bool g_found_via_trampoline = false;
 
 bool page_readable(DWORD protect) {
     if (protect & (PAGE_GUARD | PAGE_NOACCESS)) {
@@ -1374,72 +1361,6 @@ bool scan_module_for_device(char const* name) {
     return false;
 }
 
-long __stdcall end_scene_hook(void* device);
-
-bool hook_end_scene() {
-    if (!d3d_device_) {
-        return false;
-    }
-
-    std::uintptr_t vtable = 0;
-    std::memcpy(&vtable, d3d_device_, sizeof(vtable));
-    if (!span_readable(vtable + kEndSceneSlot * sizeof(void*), sizeof(void*))) {
-        return false;
-    }
-
-    auto* slot = reinterpret_cast<void**>(vtable + kEndSceneSlot * sizeof(void*));
-    if (*slot == reinterpret_cast<void*>(&end_scene_hook)) {
-        g_end_scene_hooked = true;
-        g_end_scene_slot = slot;
-        return true;
-    }
-
-    DWORD previous = 0;
-    if (!VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &previous)) {
-        return false;
-    }
-
-    g_orig_end_scene = reinterpret_cast<fn_end_scene>(*slot);
-    *slot = reinterpret_cast<void*>(&end_scene_hook);
-    VirtualProtect(slot, sizeof(void*), previous, &previous);
-    FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void*));
-    g_end_scene_slot = slot;
-    g_end_scene_hooked = true;
-    std::snprintf(g_status, sizeof(g_status), "running (endscene)");
-    return true;
-}
-
-void unhook_end_scene() {
-    if (!g_end_scene_hooked || !g_end_scene_slot || !g_orig_end_scene) {
-        g_end_scene_hooked = false;
-        return;
-    }
-
-    DWORD previous = 0;
-    if (VirtualProtect(g_end_scene_slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &previous)) {
-        if (*g_end_scene_slot == reinterpret_cast<void*>(&end_scene_hook)) {
-            *g_end_scene_slot = reinterpret_cast<void*>(g_orig_end_scene);
-        }
-        VirtualProtect(g_end_scene_slot, sizeof(void*), previous, &previous);
-        FlushInstructionCache(GetCurrentProcess(), g_end_scene_slot, sizeof(void*));
-    }
-
-    g_end_scene_hooked = false;
-    g_end_scene_slot = nullptr;
-    g_orig_end_scene = nullptr;
-}
-
-long __stdcall end_scene_hook(void* device) {
-    if (device && (device == d3d_device_ || device == reinterpret_cast<void*>(g_device))) {
-        draw_all_rings();
-    }
-
-    if (g_orig_end_scene) {
-        return g_orig_end_scene(device);
-    }
-    return 0;
-}
-
 // FFXI does not keep the D3D8 device anywhere reachable by signature, but the
 // renderer holds d3d8 resources, and every IDirect3DResource8 can hand back its
 // creator via GetDevice at vtable slot 3. Scanning for a resource and asking it
@@ -1492,205 +1413,10 @@ bool page_executable(DWORD protect) {
     }
 }
 
-// TargetRing (and GEO-HUD) copy the 9-byte prologue into a trampoline, then
-// jump back to draw_scene+9. Once the live prologue is an E9, the FFXiMain
-// signature is gone — recover the function from that trampoline instead.
-std::uintptr_t find_draw_scene_from_trampoline() {
-    std::uintptr_t ffxi_base = 0;
-    std::size_t ffxi_size = 0;
-    if (!module_range("FFXiMain.dll", ffxi_base, ffxi_size)) {
-        return 0;
-    }
-
-    unsigned char const needle[] = {
-        0x56, 0x8B, 0xF1, 0x8B, 0x86, 0x50, 0x0D, 0x00, 0x00, 0xE9,
-    };
-
-    MEMORY_BASIC_INFORMATION region {};
-    std::uintptr_t address = 0;
-    while (VirtualQuery(reinterpret_cast<void const*>(address), &region, sizeof(region))) {
-        std::uintptr_t const start = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
-        std::size_t const size = region.RegionSize;
-        std::uintptr_t const next = start + size;
-
-        if (region.State == MEM_COMMIT
-            && (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0
-            && page_executable(region.Protect)
-            && page_readable(region.Protect)
-            && size >= sizeof(needle) + 4) {
-            auto const* bytes = reinterpret_cast<unsigned char const*>(start);
-            for (std::size_t offset = 0; offset + sizeof(needle) + 4 <= size; ++offset) {
-                if (std::memcmp(bytes + offset, needle, sizeof(needle)) != 0) {
-                    continue;
-                }
-
-                std::int32_t rel = 0;
-                std::memcpy(&rel, bytes + offset + sizeof(needle), sizeof(rel));
-                std::uintptr_t const jmp_at = start + offset + 9;
-                std::uintptr_t const dest = static_cast<std::uintptr_t>(
-                    static_cast<std::intptr_t>(jmp_at + 5) + rel);
-                if (dest < ffxi_base + kPrologueBytes || dest >= ffxi_base + ffxi_size) {
-                    continue;
-                }
-
-                std::uintptr_t const candidate = dest - kPrologueBytes;
-                if (!span_readable(candidate, 5)) {
-                    continue;
-                }
-
-                unsigned char head = 0;
-                std::memcpy(&head, reinterpret_cast<void const*>(candidate), 1);
-                if (head != 0xE9) {
-                    continue;
-                }
-
-                return candidate;
-            }
-        }
-
-        if (next <= address) {
-            break;
-        }
-        address = next;
-    }
-
-    return 0;
-}
-
-bool path_has_ci(char const* path, char const* fragment) {
-    if (!path || !fragment) {
-        return false;
-    }
-    for (char const* p = path; *p; ++p) {
-        char const* a = p;
-        char const* b = fragment;
-        while (*a && *b) {
-            unsigned char ca = static_cast<unsigned char>(*a);
-            unsigned char cb = static_cast<unsigned char>(*b);
-            if (ca >= 'A' && ca <= 'Z') {
-                ca = static_cast<unsigned char>(ca - 'A' + 'a');
-            }
-            if (cb >= 'A' && cb <= 'Z') {
-                cb = static_cast<unsigned char>(cb - 'A' + 'a');
-            }
-            if (ca != cb) {
-                break;
-            }
-            ++a;
-            ++b;
-        }
-        if (*b == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool address_in_module_named(std::uintptr_t address, char const* fragment) {
-    HMODULE module = nullptr;
-    if (!GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCSTR>(address), &module)
-        || !module) {
-        return false;
-    }
-
-    char path[MAX_PATH] {};
-    if (!GetModuleFileNameA(module, path, MAX_PATH)) {
-        return false;
-    }
-    return path_has_ci(path, fragment);
-}
-
-std::uintptr_t find_hooked_draw_scene() {
-    std::uintptr_t base = 0;
-    std::size_t image = 0;
-    if (!module_range("FFXiMain.dll", base, image)) {
-        return 0;
-    }
-
-    auto const* dos = reinterpret_cast<IMAGE_DOS_HEADER const*>(base);
-    auto const* nt = reinterpret_cast<IMAGE_NT_HEADERS32 const*>(
-        base + static_cast<std::uintptr_t>(dos->e_lfanew));
-    auto const* section = IMAGE_FIRST_SECTION(nt);
-    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
-        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
-            continue;
-        }
-
-        std::uintptr_t const start = base + section->VirtualAddress;
-        std::size_t const span = section->Misc.VirtualSize;
-        if (span < kPrologueBytes || !span_readable(start, span)) {
-            continue;
-        }
-
-        auto const* bytes = reinterpret_cast<unsigned char const*>(start);
-        for (std::size_t offset = 0; offset + kPrologueBytes <= span; ++offset) {
-            if (bytes[offset] != 0xE9
-                || bytes[offset + 5] != 0x90
-                || bytes[offset + 6] != 0x90
-                || bytes[offset + 7] != 0x90
-                || bytes[offset + 8] != 0x90) {
-                continue;
-            }
-
-            std::int32_t rel = 0;
-            std::memcpy(&rel, bytes + offset + 1, sizeof(rel));
-            std::uintptr_t const dest = static_cast<std::uintptr_t>(
-                static_cast<std::intptr_t>(start + offset + 5) + rel);
-            if (address_in_module_named(dest, "TargetRing")) {
-                return start + offset;
-            }
-        }
-    }
-
-    return 0;
-}
-
-std::uintptr_t find_draw_scene() {
-    static unsigned char const pattern[] = {
-        0x56, 0x8B, 0xF1, 0x8B, 0x86, 0x50, 0x0D, 0x00, 0x00,
-    };
-    static char const mask[] = "xxxxxxxxx";
-    std::uintptr_t const direct = scan_module("FFXiMain.dll", pattern, mask, sizeof(pattern));
-    if (direct != 0) {
-        return direct;
-    }
-
-    std::uintptr_t const hooked = find_hooked_draw_scene();
-    if (hooked != 0) {
-        return hooked;
-    }
-    return find_draw_scene_from_trampoline();
-}
-
-bool code_callable(void const* p) {
-    if (!p) {
-        return false;
-    }
-
-    MEMORY_BASIC_INFORMATION region {};
-    if (!VirtualQuery(p, &region, sizeof(region))) {
-        return false;
-    }
-
-    return region.State == MEM_COMMIT
-        && page_executable(region.Protect)
-        && page_readable(region.Protect);
-}
-
-#if defined(__GNUC__)
-#define GEO_ALIGN_STACK __attribute__((force_align_arg_pointer))
-#else
-#define GEO_ALIGN_STACK
-#endif
-
-void GEO_ALIGN_STACK __fastcall draw_scene_hook(void* renderer, void* unused) {
-    if (code_callable(reinterpret_cast<void const*>(g_previous_hook))) {
-        g_previous_hook(renderer, unused);
-    } else if (g_trampoline) {
-        g_trampoline(renderer, unused);
-    }
+// Called from inside draw_scene, depth buffer still bound.
+void SCENEHOOK_ALIGN_STACK __cdecl scene_draw(void* user, void* renderer, void* device) {
+    (void)user;
+    (void)device;
 
     g_renderer = reinterpret_cast<std::uintptr_t>(renderer);
     ++g_frames;
@@ -1698,173 +1424,47 @@ void GEO_ALIGN_STACK __fastcall draw_scene_hook(void* renderer, void* unused) {
     draw_all_rings();
 }
 
-bool our_hook_installed() {
-    if (g_draw_scene == 0 || !span_readable(g_draw_scene, 5)) {
-        return false;
-    }
-
-    unsigned char bytes[5] {};
-    std::memcpy(bytes, reinterpret_cast<void const*>(g_draw_scene), sizeof(bytes));
-    if (bytes[0] != 0xE9) {
-        return false;
-    }
-
-    std::int32_t rel = 0;
-    std::memcpy(&rel, bytes + 1, sizeof(rel));
-    std::uintptr_t const dest = static_cast<std::uintptr_t>(
-        static_cast<std::intptr_t>(g_draw_scene) + 5 + rel);
-    return dest == reinterpret_cast<std::uintptr_t>(&draw_scene_hook);
-}
-
-bool ensure_trampoline() {
-    if (g_trampoline) {
-        return true;
-    }
-
-    void* trampoline = VirtualAlloc(nullptr, kPrologueBytes + 5, MEM_COMMIT | MEM_RESERVE,
-        PAGE_EXECUTE_READWRITE);
-    if (!trampoline) {
-        std::snprintf(g_status, sizeof(g_status), "trampoline alloc failed");
-        return false;
-    }
-
-    auto* bytes = static_cast<unsigned char*>(trampoline);
-    std::memcpy(bytes, kDrawScenePrologue, kPrologueBytes);
-    bytes[kPrologueBytes] = 0xE9;
-    std::int32_t const back = static_cast<std::int32_t>(
-        (g_draw_scene + kPrologueBytes)
-        - (reinterpret_cast<std::uintptr_t>(bytes) + kPrologueBytes + 5));
-    std::memcpy(bytes + kPrologueBytes + 1, &back, sizeof(back));
-    g_trampoline_mem = trampoline;
-    g_trampoline = reinterpret_cast<draw_scene_fn>(trampoline);
-    return true;
-}
-
-bool write_hook_jmp() {
-    DWORD previous = 0;
-    if (!VirtualProtect(reinterpret_cast<void*>(g_draw_scene), kPrologueBytes,
-        PAGE_EXECUTE_READWRITE, &previous)) {
-        std::snprintf(g_status, sizeof(g_status), "VirtualProtect failed");
-        return false;
-    }
-
-    auto* target = reinterpret_cast<unsigned char*>(g_draw_scene);
-    std::int32_t const jump = static_cast<std::int32_t>(
-        reinterpret_cast<std::uintptr_t>(&draw_scene_hook) - (g_draw_scene + 5));
-    target[0] = 0xE9;
-    std::memcpy(target + 1, &jump, sizeof(jump));
-    for (std::size_t i = 5; i < kPrologueBytes; ++i) {
-        target[i] = 0x90;
-    }
-
-    VirtualProtect(reinterpret_cast<void*>(g_draw_scene), kPrologueBytes, previous, &previous);
-    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(g_draw_scene), kPrologueBytes);
-    return true;
-}
-
 bool install_hook() {
-    if (our_hook_installed()) {
-        g_hooked = true;
-        return true;
+    if (!g_bus) {
+        g_bus = scenehook_attach();
     }
 
-    DWORD const now = GetTickCount();
-    if (g_next_find_ms != 0 && now < g_next_find_ms) {
+    if (!g_bus) {
+        std::snprintf(g_status, sizeof(g_status),
+            "scene hook unavailable (another addon may be built against a different ABI)");
         return false;
     }
 
-    g_draw_scene = find_draw_scene();
-    if (g_draw_scene == 0) {
-        g_next_find_ms = now + 1000;
-        std::snprintf(g_status, sizeof(g_status), "draw_scene signature not found");
+    if (!scenehook_ensure_hook(g_bus)) {
+        std::snprintf(g_status, sizeof(g_status), "%s", g_bus->status);
         return false;
     }
 
-    g_next_find_ms = 0;
-    if (!span_readable(g_draw_scene, kPrologueBytes)) {
-        std::snprintf(g_status, sizeof(g_status), "draw_scene not readable");
-        return false;
-    }
-    if (!ensure_trampoline()) {
-        return false;
-    }
-
-    unsigned char head[kPrologueBytes] {};
-    std::memcpy(head, reinterpret_cast<void const*>(g_draw_scene), kPrologueBytes);
-    std::memcpy(g_replaced_bytes, head, kPrologueBytes);
-    g_previous_hook = nullptr;
-
-    if (head[0] == 0xE9) {
-        std::int32_t rel = 0;
-        std::memcpy(&rel, head + 1, sizeof(rel));
-        std::uintptr_t const dest = static_cast<std::uintptr_t>(
-            static_cast<std::intptr_t>(g_draw_scene) + 5 + rel);
-        if (dest == reinterpret_cast<std::uintptr_t>(&draw_scene_hook)) {
-            g_hooked = true;
-            return true;
-        }
-        if (code_callable(reinterpret_cast<void*>(dest))) {
-            g_previous_hook = reinterpret_cast<draw_scene_fn>(dest);
+    if (g_bus_slot < 0) {
+        g_bus_slot = scenehook_register(g_bus, &scene_draw, nullptr);
+        if (g_bus_slot < 0) {
+            std::snprintf(g_status, sizeof(g_status), "scene hook is full");
+            return false;
         }
     }
 
-    if (!write_hook_jmp()) {
-        return false;
-    }
-
+    scenehook_set_enabled(g_bus, g_bus_slot, true);
     g_hooked = true;
-    std::snprintf(g_status, sizeof(g_status),
-        g_previous_hook ? "running (chained n24)" : "running (n24)");
+    std::snprintf(g_status, sizeof(g_status), "running");
     return true;
 }
 
+// The patch is shared and is never removed. The slot is released in DllMain.
 bool remove_hook() {
-    unhook_end_scene();
-
-    if (!g_hooked) {
-        std::snprintf(g_status, sizeof(g_status), "unhooked");
-        return true;
-    }
-
     lock_rings();
     g_ring_count = 0;
     unlock_rings();
+
     g_hooked = false;
-
-    bool restored = false;
-    if (our_hook_installed()) {
-        unsigned char const* restore = kDrawScenePrologue;
-        if (code_callable(reinterpret_cast<void const*>(g_previous_hook))) {
-            restore = g_replaced_bytes;
-        }
-
-        DWORD previous = 0;
-        if (!VirtualProtect(reinterpret_cast<void*>(g_draw_scene), kPrologueBytes,
-            PAGE_EXECUTE_READWRITE, &previous)) {
-            return false;
-        }
-
-        std::memcpy(reinterpret_cast<void*>(g_draw_scene), restore, kPrologueBytes);
-        VirtualProtect(reinterpret_cast<void*>(g_draw_scene), kPrologueBytes, previous, &previous);
-        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(g_draw_scene), kPrologueBytes);
-        restored = true;
-    }
-
-    g_previous_hook = nullptr;
-    g_last_seen_frames = 0;
-    g_inner_ok_ms = 0;
     g_device_attempts = 0;
-    Sleep(60);
 
-    // Only safe once our jump is gone. If another addon chained on top of us our
-    // hook stays live, and draw_scene_hook still falls back to g_trampoline.
-    if (restored && g_trampoline_mem) {
-        VirtualFree(g_trampoline_mem, 0, MEM_RELEASE);
-        g_trampoline_mem = nullptr;
-        g_trampoline = nullptr;
-    }
-
-    std::snprintf(g_status, sizeof(g_status), "unhooked");
+    scenehook_set_enabled(g_bus, g_bus_slot, false);
+    std::snprintf(g_status, sizeof(g_status), "stopped");
     return true;
 }
 
@@ -1881,11 +1481,14 @@ int __cdecl lua_stop(lua_State* L) {
 }
 
 int __cdecl lua_status(lua_State* L) {
-    char report[320] {};
+    char bus[224] {};
+    scenehook_describe(g_bus, g_bus_slot, bus, sizeof(bus));
+
+    char report[512] {};
     std::snprintf(report, sizeof(report),
-        "n35 hooked=%s frames=%lu draws=%lu device=%08lX rings=%d | %s",
+        "n36 drawing=%s frames=%lu draws=%lu device=%08lX rings=%d | %s | %s",
         g_hooked ? "yes" : "no", g_frames, g_draws,
-        static_cast<unsigned long>(g_device), g_ring_count, g_status);
+        static_cast<unsigned long>(g_device), g_ring_count, g_status, bus);
     g_lua.pushstring(L, report);
     return 1;
 }
@@ -2037,9 +1640,13 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings(lua_State* L) {
 
     build_tables();
 
+    lock_rings();
+    g_ring_count = 0;
+    unlock_rings();
+
     g_lua.createtable(L, 0, 11);
 
-    g_lua.pushstring(L, "1.9.5");
+    g_lua.pushstring(L, "2.0.0");
     g_lua.setfield(L, -2, "native");
 
     g_lua.pushcclosure(L, lua_start, 0);
@@ -2137,6 +1744,10 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings35(lua_State* L) {
     return luaopen__GEORings(L);
 }
 
+extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings36(lua_State* L) {
+    return luaopen__GEORings(L);
+}
+
 extern "C" __declspec(dllexport) int __cdecl luaopen__GEORings_new(lua_State* L) {
     return luaopen__GEORings(L);
 }
@@ -2147,7 +1758,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
         InitializeCriticalSection(&g_ring_lock);
         g_ring_lock_ready = true;
     } else if (reason == DLL_PROCESS_DETACH) {
-        remove_hook();
+        // Runs however the addon goes away, and before the image is
+        // unmapped. Hands the frame to a surviving client if we own it.
+        // may_wait is false: the loader lock is held here.
+        scenehook_unregister(g_bus, g_bus_slot, false);
+        g_bus_slot = -1;
         if (g_ring_lock_ready) {
             g_ring_lock_ready = false;
             DeleteCriticalSection(&g_ring_lock);
